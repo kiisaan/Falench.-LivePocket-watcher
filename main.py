@@ -46,37 +46,35 @@ def save_notified_urls(new_urls, existing_urls):
 
 def is_falench_performing(soup):
     """
-    イベント詳細ページで「Falench」または「Falench.」という文字列が
-    正しい文字順で並んでいる要素（出演者領域や本文ブロック）のみを判定する関数
+    イベント詳細ページの「メイン本文エリア（イベント説明文）」内にのみ
+    Falench が出演者として記載されているか高精度に判定する関数
     """
-    # 1. 関連イベント・おすすめ表示・フッター・ヘッダー等の枠を除去
+    # 1. 関連イベント・おすすめ表示・フッター・サイドバーなどを全方位で削除
     for unwanted in soup.select(
         ".recommend, .other-events, .related-events, footer, header, #header, "
-        ".sidebar, .other-event-list, .recommend-event"
+        ".sidebar, .other-event-list, .recommend-event, .seller-event, "
+        "[class*='recommend'], [class*='other'], [id*='recommend'], [id*='other']"
     ):
         unwanted.decompose()
 
-    # 正しい文字順の「falench」にマッチする正規表現パターン (大文字・小文字不問)
     pattern = re.compile(r'falench(?:\.|\b)', re.IGNORECASE)
 
-    # 2. イベントタイトル（h1）に「Falench」が正しい単語順で含まれている場合
+    # 2. イベントタイトル（h1）に Falench が含まれる場合は即判定
     title_element = soup.find("h1") or soup.find("title")
-    if title_element:
-        title_text = title_element.get_text(strip=True)
-        if pattern.search(title_text):
-            print(f"[CHECK] タイトル内で「Falench」の正規表現一致を確認: {title_text[:40]}")
-            return True
+    if title_element and pattern.search(title_element.get_text()):
+        return True
 
-    # 3. ページ内の各コンテンツブロック（div, p, li, td, span等）を検証
-    blocks = soup.find_all(["div", "p", "li", "td", "span", "dd", "dt"])
+    # 3. メインのイベント詳細本文エリアのみを取得（サイドバーや関連リンクを除外）
+    main_content = soup.select_one("#event-detail, .event-detail, .main-content, #main")
+    target_soup = main_content if main_content else soup
+
+    # 4. メイン本文エリア内の各テキストブロックから Falench を探す
+    blocks = target_soup.find_all(["div", "p", "li", "td", "span", "dd", "dt"])
 
     for block in blocks:
-        # 子要素を含まない、または最下層に近いテキストノードの並びを確認
         block_text = block.get_text(strip=True)
-        
-        # 単語として正しい順番で「Falench」が存在するか確認
         if pattern.search(block_text):
-            # 文字数が非常に長い巨大コンテナ（ページ全体等）ではなく、適切な文章/要素ブロックの場合
+            # ページ全体を含む親ブロックなどを除外するため、適度な文字数（300文字未満）のブロックで判定
             if len(block_text) < 300:
                 print(f"[CHECK] 正確な「Falench」の一致を確認: {block_text[:50]}")
                 return True
