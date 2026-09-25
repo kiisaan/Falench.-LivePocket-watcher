@@ -7,9 +7,29 @@ from playwright.sync_api import sync_playwright
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-# 検索ワード「Falench」で検索ページを指定
-SEARCH_URL = "https://livepocket.jp/event/search?search_word=Falench"
 CACHE_FILE = "notified_urls.txt"
+
+# -------------------------------------------------------------------
+# ★ 巡回対象の主催者（販売元）リスト
+# LivePocketの主催者ページURLまたはIDを追加するだけで自動巡回します
+# -------------------------------------------------------------------
+ORGANIZERS = [
+    {
+        "name": "SCOT",
+        "url": "https://livepocket.jp/p/i39be"  # SCOT等の主催者マイページ/イベント一覧URL
+    },
+    # 今後増えた場合はここに追加できます（例）:
+    # {
+    #     "name": "主催者名",
+    #     "url": "https://livepocket.jp/p/xxxx"
+    # },
+]
+
+# 検索キーワード（念のため従来のキーワード検索も併用）
+SEARCH_URLS = [
+    "https://livepocket.jp/event/search?search_word=Falench",
+] + [org["url"] for org in ORGANIZERS]
+
 
 def load_notified_urls():
     if os.path.exists(CACHE_FILE):
@@ -20,6 +40,7 @@ def load_notified_urls():
     print("[DEBUG] キャッシュファイルが存在しません（初回実行）。")
     return set()
 
+
 def save_notified_urls(new_urls, existing_urls):
     all_urls = existing_urls.union(new_urls)
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -27,9 +48,11 @@ def save_notified_urls(new_urls, existing_urls):
             f.write(f"{url}\n")
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
+
 def fetch_falench_events(notified_urls):
     new_events = []
-    
+    candidate_urls = set()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -38,40 +61,39 @@ def fetch_falench_events(notified_urls):
         )
         page = context.new_page()
 
-        print(f"[DEBUG] 検索ページをPlaywrightで描画中: {SEARCH_URL}")
-        page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(3000) # JSの描画完了まで待機
+        # 1. 各ターゲットURL（キーワード検索 ＋ 主催者ページ一覧）から全イベントリンクを収集
+        for target_url in SEARCH_URLS:
+            print(f"[DEBUG] ページをスキャン中: {target_url}")
+            try:
+                page.goto(target_url, wait_until="networkidle", timeout=60000)
+                page.wait_for_timeout(2000)
 
-        html_content = page.content()
-        soup = BeautifulSoup(html_content, "html.parser")
+                html_content = page.content()
+                soup = BeautifulSoup(html_content, "html.parser")
 
-        # ページ内のイベントURL (/e/ または /event/detail/) を抽出
-        links = soup.find_all("a", href=True)
-        candidate_urls = []
-        seen_urls = set()
+                links = soup.find_all("a", href=True)
+                for a_tag in links:
+                    href = a_tag["href"]
+                    # イベント詳細のURLパターンを抽出
+                    if "/e/" not in href and "/event/detail/" not in href:
+                        continue
 
-        for a_tag in links:
-            href = a_tag["href"]
-            if "/e/" not in href and "/event/detail/" not in href:
-                continue
+                    full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
+                    clean_url = full_url.split("?")[0]
 
-            full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
-            clean_url = full_url.split("?")[0]
+                    if "/event/search" in clean_url:
+                        continue
 
-            if "/event/search" in clean_url or clean_url in seen_urls:
-                continue
+                    if clean_url in notified_urls:
+                        continue
 
-            seen_urls.add(clean_url)
+                    candidate_urls.add(clean_url)
+            except Exception as e:
+                print(f"[WARN] スキャン失敗 ({target_url}): {e}")
 
-            if clean_url in notified_urls:
-                print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
-                continue
+        print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidate_urls)}")
 
-            candidate_urls.append(clean_url)
-
-        print(f"[DEBUG] 発見した未通知イベント候補数: {len(candidate_urls)}")
-
-        # 各イベント詳細ページに直接アクセスしてFalenchが出演しているか検証
+        # 2. 収集した各イベントの詳細ページを開き「Falench」が記載されているか個別検証
         for url in candidate_urls:
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
@@ -82,12 +104,12 @@ def fetch_falench_events(notified_urls):
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
                 page_text = detail_soup.get_text(separator=" ", strip=True)
 
-                # 「falench」というテキストが詳細ページに含まれているかチェック
+                # ページ本文内に大文字小文字問わず「falench」が含まれるか判定
                 if "falench" in page_text.lower():
                     title_tag = detail_soup.find("h1") or detail_soup.find("title")
                     raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
-                    
-                    # サイト名などを削って整形
+
+                    # タイトル整形
                     clean_title = raw_title.replace(" - LivePocket-Ticket-", "").replace("｜LivePocket", "")
                     clean_title = re.sub(r'\s+', ' ', clean_title).strip()
                     if len(clean_title) > 70:
@@ -99,12 +121,13 @@ def fetch_falench_events(notified_urls):
                     print(f"[EXCLUDE] Falench非出演のため除外: {url}")
 
             except Exception as e:
-                print(f"[WARN] ページ検証エラー ({url}): {e}")
+                print(f"[WARN] 詳細検証失敗 ({url}): {e}")
 
         browser.close()
 
     print(f"[DEBUG] 最終抽出された「Falench.」出演ライブ数: {len(new_events)}")
     return new_events
+
 
 def send_line_notification(events):
     if not events:
@@ -140,6 +163,7 @@ def send_line_notification(events):
     else:
         print(f"[ERROR] LINE送信失敗: {res.status_code}")
         return False
+
 
 if __name__ == "__main__":
     notified_urls = load_notified_urls()
