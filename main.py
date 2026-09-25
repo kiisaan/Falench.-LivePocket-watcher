@@ -2,13 +2,27 @@ import os
 import requests
 from bs4 import BeautifulSoup
 
-# 環境変数からLINEのトークンと宛先IDを取得
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
 TARGET_URL = "https://livepocket.jp/event/search?performer=Falench."
+CACHE_FILE = "notified_urls.txt"
 
-def fetch_events():
+def load_notified_urls():
+    """過去に通知済みのURLリストを読み込む"""
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def save_notified_urls(new_urls, existing_urls):
+    """新しいURLをファイルに追記・保存する"""
+    all_urls = existing_urls.union(new_urls)
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        for url in sorted(all_urls):
+            f.write(f"{url}\n")
+
+def fetch_events(notified_urls):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -16,10 +30,8 @@ def fetch_events():
     response.raise_for_status()
     
     soup = BeautifulSoup(response.text, "html.parser")
-    events = []
+    new_events = []
     
-    # LivePocketのイベントカード要素を抽出
-    # ※サイト構造の変更に応じてセレクタを調整してください
     event_elements = soup.select(".event-list-item, .search-result-item, a[href*='/e/']")
     
     seen_urls = set()
@@ -29,22 +41,24 @@ def fetch_events():
             continue
             
         full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
-        if full_url in seen_urls:
+        
+        # 今回のループ内での重複チェック & 過去に通知済みかチェック
+        if full_url in seen_urls or full_url in notified_urls:
             continue
         seen_urls.add(full_url)
         
         title = elem.get_text(strip=True) or "Falench. 掲載イベント"
-        events.append({"title": title, "url": full_url})
+        new_events.append({"title": title, "url": full_url})
         
-    return events
+    return new_events
 
 def send_line_notification(events):
     if not events:
-        print("新規・該当イベントは見つかりませんでした。")
-        return
+        print("新しいイベントはありませんでした。")
+        return False
 
-    message_text = "🎵 【Falench.】ライブポケット新着・該当イベント\n\n"
-    for event in events[:5]:  # 一度に送信する件数を制限（必要に応じて調整）
+    message_text = "🎉 【Falench.】新しいチケット・イベントが追加されました！\n\n"
+    for event in events:
         message_text += f"📌 {event['title']}\n🔗 {event['url']}\n\n"
 
     endpoint = "https://api.line.me/v2/bot/message/push"
@@ -64,10 +78,18 @@ def send_line_notification(events):
     
     res = requests.post(endpoint, json=payload, headers=headers)
     if res.status_code == 200:
-        print("LINEへの通知が完了しました。")
+        print("新着イベントのLINE通知が完了しました。")
+        return True
     else:
         print(f"LINE送信エラー: {res.status_code} - {res.text}")
+        return False
 
 if __name__ == "__main__":
-    found_events = fetch_events()
-    send_line_notification(found_events)
+    notified_urls = load_notified_urls()
+    new_events = fetch_events(notified_urls)
+    
+    if new_events:
+        success = send_line_notification(new_events)
+        if success:
+            new_urls = {e["url"] for e in new_events}
+            save_notified_urls(new_urls, notified_urls)
