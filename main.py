@@ -11,9 +11,7 @@ LINE_USER_ID = os.environ.get("LINE_USER_ID")
 CACHE_FILE = "notified_urls.txt"
 ORGANIZERS_FILE = "organizers.json"
 
-# -------------------------------------------------------------------
-# ★ 主催者リスト（organizers.json）の読み込み関数
-# -------------------------------------------------------------------
+
 def load_organizers():
     if os.path.exists(ORGANIZERS_FILE):
         try:
@@ -46,14 +44,49 @@ def save_notified_urls(new_urls, existing_urls):
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
 
+def is_falench_in_cast(soup):
+    """
+    出演者情報セクション（または概要本文）の中に限定して Falench が記載されているか厳密判定する関数
+    おすすめイベント枠やフッターなどの誤検知を防止します
+    """
+    # 1. LivePocketの「出演者」要素を直接ターゲット取得
+    cast_elements = soup.select(".cast, .performer, .artist, .event-cast, #cast")
+    
+    # 見つかった要素内から文字列を検証
+    for elem in cast_elements:
+        if "falench" in elem.get_text().lower():
+            return True
+
+    # 2. クラス名で取得できない場合、「出演」「CAST」「出演者」の見出し周辺のテキストを検索
+    for h_tag in soup.find_all(["h2", "h3", "h4", "dt", "th", "strong"]):
+        text = h_tag.get_text().strip()
+        if any(keyword in text for keyword in ["出演", "CAST", "Cast", "出演者", "ARTIST", "Artist"]):
+            # 見出しの親要素または次の要素（dd, td, divなど）を取得
+            parent = h_tag.parent
+            if parent and "falench" in parent.get_text().lower():
+                return True
+            next_sibling = h_tag.find_next_sibling()
+            if next_sibling and "falench" in next_sibling.get_text().lower():
+                return True
+
+    # 3. 予備判定: イベント本文（description）の中に記載があるか確認
+    # ※おすすめイベントなどの領域（.recommend, .other-events, footer等）を除外して本文から検索
+    for unwanted in soup.select(".recommend, .other-events, .related-events, footer, .sidebar, #header"):
+        unwanted.decompose() # 関連イベント等のDOMを完全破棄
+
+    body_text = soup.get_text(separator=" ", strip=True)
+    if "falench" in body_text.lower():
+        return True
+
+    return False
+
+
 def fetch_falench_events(notified_urls):
     new_events = []
     candidate_urls = set()
 
-    # 外部ファイルから主催者リストを読み込み
     organizers = load_organizers()
 
-    # キーワード検索 ＋ 外部リストで指定した主催者URLを結合
     search_urls = [
         "https://livepocket.jp/event/search?search_word=Falench",
     ] + [org["url"] for org in organizers if "url" in org]
@@ -66,7 +99,7 @@ def fetch_falench_events(notified_urls):
         )
         page = context.new_page()
 
-        # 1. 各ターゲットURL（キーワード検索 ＋ 各主催者ページ）から全イベントリンクを収集
+        # 1. 各ソースからイベント詳細URLを収集
         for target_url in search_urls:
             print(f"[DEBUG] ページをスキャン中: {target_url}")
             try:
@@ -97,7 +130,7 @@ def fetch_falench_events(notified_urls):
 
         print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidate_urls)}")
 
-        # 2. 収集した各イベントの詳細ページを開き「Falench」が記載されているか個別検証
+        # 2. 各イベントの詳細ページを開き「出演欄」にFalenchがあるか正確に検証
         for url in candidate_urls:
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
@@ -106,9 +139,9 @@ def fetch_falench_events(notified_urls):
 
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
-                page_text = detail_soup.get_text(separator=" ", strip=True)
 
-                if "falench" in page_text.lower():
+                # 出演者欄厳密チェック関数を実行
+                if is_falench_in_cast(detail_soup):
                     title_tag = detail_soup.find("h1") or detail_soup.find("title")
                     raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
 
@@ -117,10 +150,10 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
+                    print(f"[MATCH] ★出演者欄にFalench.の出演を確認！: {clean_title} ({url})")
                     new_events.append({"title": clean_title, "url": url})
                 else:
-                    print(f"[EXCLUDE] Falench非出演のため除外: {url}")
+                    print(f"[EXCLUDE] Falench非出演（または関連枠の表示）のため除外: {url}")
 
             except Exception as e:
                 print(f"[WARN] 詳細検証失敗 ({url}): {e}")
