@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      clear_cache:
+        description: 'キャッシュをクリアして強制的に全件取得しますか？'
+        type: boolean
+        default: false
 
 jobs:
   run-bot:
@@ -23,7 +28,9 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
+      # 手動実行で clear_cache チェックボックスを入れていない場合のみキャッシュを復元
       - name: 通知済みキャッシュの復元
+        if: ${{ inputs.clear_cache != true }}
         uses: actions/cache@v4
         with:
           path: notified_urls.txt
