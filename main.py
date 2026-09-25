@@ -5,7 +5,8 @@ from bs4 import BeautifulSoup
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-TARGET_URL = "https://livepocket.jp/event/search?performer=Falench."
+# 検索ワード指定のURLに変更
+TARGET_URL = "https://livepocket.jp/event/search?search_word=Falench."
 CACHE_FILE = "notified_urls.txt"
 
 def load_notified_urls():
@@ -26,41 +27,48 @@ def save_notified_urls(new_urls, existing_urls):
 
 def fetch_events(notified_urls):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     }
+    
+    print(f"[DEBUG] 取得元URL: {TARGET_URL}")
     response = requests.get(TARGET_URL, headers=headers)
     response.raise_for_status()
     
     soup = BeautifulSoup(response.text, "html.parser")
     new_events = []
     
-    # イベントページのリンク（/e/ を含むaタグ）を広範に抽出
+    # ページ内のすべての <a> タグから /event/ または /e/ を含むリンクを収集
     links = soup.find_all("a", href=True)
+    print(f"[DEBUG] ページ内で発見した全リンク数: {len(links)}")
     
     seen_urls = set()
     for a_tag in links:
         href = a_tag["href"]
-        if "/e/" not in href:
+        
+        # LivePocketのイベント詳細ページURLパターン (/event/detail/ や /e/ xxx)
+        if "/e/" not in href and "/event/detail/" not in href:
             continue
             
         full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
-        
-        # クエリパラメータを取り除いて正規化（例: /e/abc?xxx -> /e/abc）
         clean_url = full_url.split("?")[0]
         
+        # 検索一覧ページ自体のURLなどを除外
+        if "/event/search" in clean_url:
+            continue
+
         if clean_url in seen_urls:
             continue
         seen_urls.add(clean_url)
         
-        # 過去に通知済みかチェック
         if clean_url in notified_urls:
             print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
             continue
         
+        # タイトル文字列の整形
         title = a_tag.get_text(strip=True) or "Falench. 掲載イベント"
-        # 不要な改行や長すぎるテキストの調整
-        if len(title) > 50:
-            title = title[:50] + "..."
+        if len(title) > 60:
+            title = title[:60] + "..."
             
         new_events.append({"title": title, "url": clean_url})
         
