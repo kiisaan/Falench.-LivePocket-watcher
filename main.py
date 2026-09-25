@@ -79,41 +79,70 @@ def is_falench_performing(soup):
 
 def extract_event_details(soup):
     """
-    イベント詳細ページから「開催日程」と「チケット販売受付期間」を抽出する関数
+    LivePocket特有のタグ構造に対応した開催日程・チケット販売期間抽出関数
     """
-    event_date = "確認できませんでした"
-    sales_period = "確認できませんでした"
+    event_date = None
+    sales_period = None
 
-    # LivePocketの構造（dt/dd または テーブル/定義リスト）から日程・受付期間を取得
-    for dt in soup.find_all(["dt", "th", "div", "span"]):
-        text = dt.get_text(strip=True)
-        
-        # 1. 開催日時・日程の抽出
-        if any(kw in text for kw in ["日程", "開催日", "日時", "開催日時"]):
-            dd = dt.find_next_sibling(["dd", "td", "div", "p"])
-            if dd:
-                val = dd.get_text(separator=" ", strip=True)
-                if val and len(val) < 100:
-                    event_date = val
+    # 1. 開催日時の抽出（LivePocketの概要テーブル・詳細ブロックから収集）
+    date_patterns = [
+        # 定義リスト (dt / dd) のパターン
+        ("dt", ["日程", "日時", "開催日", "開催日時"]),
+        ("th", ["日程", "日時", "開催日", "開催日時"]),
+        ("span", ["日程", "日時", "開催日", "開催日時"]),
+        ("p", ["日程", "日時", "開催日", "開催日時"])
+    ]
 
-        # 2. チケット販売期間・受付期間の抽出
-        if any(kw in text for kw in ["販売期間", "受付期間", "申込期間", "販売"]):
-            dd = dt.find_next_sibling(["dd", "td", "div", "p"])
-            if dd:
-                val = dd.get_text(separator=" ", strip=True)
-                if val and len(val) < 120:
-                    sales_period = val
+    for tag_name, keywords in date_patterns:
+        if event_date:
+            break
+        for tag in soup.find_all(tag_name):
+            txt = tag.get_text().strip()
+            if any(kw == txt or kw in txt for kw in keywords):
+                # 直後のdd, td, span等を取得
+                sibling = tag.find_next_sibling(["dd", "td", "span", "p", "div"])
+                if sibling:
+                    val = sibling.get_text(separator=" ", strip=True)
+                    if val and len(val) < 120:
+                        event_date = val
+                        break
 
-    # チケットエリア（.ticket-infoや#ticket等）からの予備取得
-    if sales_period == "確認できませんでした":
-        ticket_box = soup.select_one(".ticket-info, .ticket-list, #ticket")
-        if ticket_box:
-            txt = ticket_box.get_text(separator=" ", strip=True)
-            match = re.search(r'(\d{4}/\d{1,2}/\d{1,2}.*?～.*?\d{4}/\d{1,2}/\d{1,2}.*?)(?=\s|$)', txt)
-            if match:
-                sales_period = match.group(1)
+    # 2. チケット販売期間の抽出（チケット一覧枠 .ticket_list, .ticket-list, .ticket_sales_period 等から直接取得）
+    sales_patterns = [
+        ("dt", ["販売期間", "受付期間", "申込期間", "販売"]),
+        ("th", ["販売期間", "受付期間", "申込期間", "販売"]),
+        ("span", ["販売期間", "受付期間", "申込期間", "販売"])
+    ]
 
-    return event_date, sales_period
+    for tag_name, keywords in sales_patterns:
+        if sales_period:
+            break
+        for tag in soup.find_all(tag_name):
+            txt = tag.get_text().strip()
+            if any(kw == txt or kw in txt for kw in keywords):
+                sibling = tag.find_next_sibling(["dd", "td", "span", "p", "div"])
+                if sibling:
+                    val = sibling.get_text(separator=" ", strip=True)
+                    if val and len(val) < 150:
+                        sales_period = val
+                        break
+
+    # 3. テキスト抽出で見つからない場合の正規表現バックアップ（日付フォーマットから逆引き）
+    full_text = soup.get_text(separator="\n", strip=True)
+
+    if not event_date:
+        # 例: 2026/10/10(土) 18:00 または 2026年10月10日 などのパターンを探す
+        date_match = re.search(r'(\d{4}[/年]\d{1,2}[/月]\d{1,2}日?\s*\(?[\u4e00-\u9fa5]?\)?\s*\d{1,2}:\d{2}~?)', full_text)
+        if date_match:
+            event_date = date_match.group(1)
+
+    if not sales_period:
+        # 例: 2026/09/20(日) 20:00 ～ 2026/10/09(金) 23:59 のパターンを探す
+        period_match = re.search(r'(\d{4}[/年]\d{1,2}[/月]\d{1,2}.*?～.*?\d{4}[/年]\d{1,2}[/月]\d{1,2}.*?)(?=\n|$)', full_text)
+        if period_match:
+            sales_period = period_match.group(1)
+
+    return event_date or "要確認（詳細ページ参照）", sales_period or "要確認（詳細ページ参照）"
 
 
 def fetch_falench_events(notified_urls):
@@ -169,8 +198,9 @@ def fetch_falench_events(notified_urls):
         for url in candidate_urls:
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(1000)
+                # JSレンダリング完了のため networkidle で待機
+                page.goto(url, wait_until="networkidle", timeout=20000)
+                page.wait_for_timeout(2000)
 
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
@@ -188,6 +218,8 @@ def fetch_falench_events(notified_urls):
                     event_date, sales_period = extract_event_details(detail_soup)
 
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
+                    print(f"       日程: {event_date} / 販売期間: {sales_period}")
+
                     new_events.append({
                         "title": clean_title,
                         "url": url,
