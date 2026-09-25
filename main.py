@@ -1,11 +1,11 @@
 import os
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-# 検索ワード指定のURLに変更
 TARGET_URL = "https://livepocket.jp/event/search?search_word=Falench."
 CACHE_FILE = "notified_urls.txt"
 
@@ -25,35 +25,44 @@ def save_notified_urls(new_urls, existing_urls):
             f.write(f"{url}\n")
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
-def fetch_events(notified_urls):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
-    }
+def fetch_events_with_playwright(notified_urls):
+    print(f"[DEBUG] Playwrightでページを開きます: {TARGET_URL}")
     
-    print(f"[DEBUG] 取得元URL: {TARGET_URL}")
-    response = requests.get(TARGET_URL, headers=headers)
-    response.raise_for_status()
-    
-    soup = BeautifulSoup(response.text, "html.parser")
-    new_events = []
-    
-    # ページ内のすべての <a> タグから /event/ または /e/ を含むリンクを収集
+    html_content = ""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        # 一般的なPCブラウザのUser-Agentを設定してブロックを回避
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={'width': 1280, 'height': 800}
+        )
+        page = context.new_page()
+        
+        # ページにアクセスしてネットワークの読み込みが安定するまで待機
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        # JavaScriptの非同期レンダリングを考慮して3秒追加待機
+        page.wait_for_timeout(3000)
+        
+        html_content = page.content()
+        browser.close()
+
+    soup = BeautifulSoup(html_content, "html.parser")
     links = soup.find_all("a", href=True)
-    print(f"[DEBUG] ページ内で発見した全リンク数: {len(links)}")
-    
+    print(f"[DEBUG] 取得成功！ ページ内で発見した全リンク数: {len(links)}")
+
+    new_events = []
     seen_urls = set()
+
     for a_tag in links:
         href = a_tag["href"]
         
-        # LivePocketのイベント詳細ページURLパターン (/event/detail/ や /e/ xxx)
+        # イベントページのURLパターン（/e/ または /event/detail/）
         if "/e/" not in href and "/event/detail/" not in href:
             continue
             
         full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
         clean_url = full_url.split("?")[0]
         
-        # 検索一覧ページ自体のURLなどを除外
         if "/event/search" in clean_url:
             continue
 
@@ -65,7 +74,6 @@ def fetch_events(notified_urls):
             print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
             continue
         
-        # タイトル文字列の整形
         title = a_tag.get_text(strip=True) or "Falench. 掲載イベント"
         if len(title) > 60:
             title = title[:60] + "..."
@@ -112,7 +120,7 @@ def send_line_notification(events):
 
 if __name__ == "__main__":
     notified_urls = load_notified_urls()
-    new_events = fetch_events(notified_urls)
+    new_events = fetch_events_with_playwright(notified_urls)
     
     if new_events:
         success = send_line_notification(new_events)
