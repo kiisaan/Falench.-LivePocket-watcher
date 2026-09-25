@@ -44,51 +44,43 @@ def save_notified_urls(new_urls, existing_urls):
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
 
-def is_falench_in_cast(soup):
+def is_falench_performing(soup):
     """
-    出演者情報セクション（または「出演」「CAST」見出しの直下）に限定して
-    Falench が記載されているか厳密判定する関数
+    イベント詳細ページで「Falench」または「Falench.」という文字列が
+    正しい文字順で並んでいる要素（出演者領域や本文ブロック）のみを判定する関数
     """
-    # 1. ノイズとなる領域（関連イベント・注意事項・フッター・ヘッダー・モーダル）をあらかじめ削除
+    # 1. 関連イベント・おすすめ表示・フッター・ヘッダー等の枠を除去
     for unwanted in soup.select(
-        ".recommend, .other-events, .related-events, footer, .sidebar, #header, "
-        ".modal, .notice, .attention, .faq, .ticket-info, #ticket-info"
+        ".recommend, .other-events, .related-events, footer, header, #header, "
+        ".sidebar, .other-event-list, .recommend-event"
     ):
         unwanted.decompose()
 
-    # 2. LivePocketの指定クラス（出演者欄）をピンポイント取得
-    cast_elements = soup.select(".cast, .performer, .artist, .event-cast, #cast, .cast-list")
-    for elem in cast_elements:
-        if "falench" in elem.get_text().lower():
-            print(f"[CHECK] クラス判定でFalenchを発見: {elem.get_text()[:30]}")
+    # 正しい文字順の「falench」にマッチする正規表現パターン (大文字・小文字不問)
+    pattern = re.compile(r'falench(?:\.|\b)', re.IGNORECASE)
+
+    # 2. イベントタイトル（h1）に「Falench」が正しい単語順で含まれている場合
+    title_element = soup.find("h1") or soup.find("title")
+    if title_element:
+        title_text = title_element.get_text(strip=True)
+        if pattern.search(title_text):
+            print(f"[CHECK] タイトル内で「Falench」の正規表現一致を確認: {title_text[:40]}")
             return True
 
-    # 3. 「出演」「CAST」「ARTIST」などの見出し要素を探し、その配下・直後のテキストのみを検証
-    keywords = ["出演", "cast", "artist", "出演者", "パーソナリティ"]
-    
-    for h_tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "dt", "th", "strong", "p", "div"]):
-        tag_text = h_tag.get_text().strip().lower()
+    # 3. ページ内の各コンテンツブロック（div, p, li, td, span等）を検証
+    blocks = soup.find_all(["div", "p", "li", "td", "span", "dd", "dt"])
+
+    for block in blocks:
+        # 子要素を含まない、または最下層に近いテキストノードの並びを確認
+        block_text = block.get_text(strip=True)
         
-        # 見出し自体が「出演」や「CAST」などのキーワードを含んでいるか判定
-        if any(kw == tag_text or kw in tag_text for kw in keywords):
-            # ① 見出しタグの親要素の中身をチェック
-            parent = h_tag.parent
-            if parent and "falench" in parent.get_text().lower():
-                print(f"[CHECK] 見出し親要素でFalenchを発見")
+        # 単語として正しい順番で「Falench」が存在するか確認
+        if pattern.search(block_text):
+            # 文字数が非常に長い巨大コンテナ（ページ全体等）ではなく、適切な文章/要素ブロックの場合
+            if len(block_text) < 300:
+                print(f"[CHECK] 正確な「Falench」の一致を確認: {block_text[:50]}")
                 return True
 
-            # ② 見出しタグの「次のお兄さん・弟要素（Sibling）」をチェック
-            curr = h_tag.next_sibling
-            search_count = 0
-            while curr and search_count < 3:
-                if hasattr(curr, "get_text"):
-                    if "falench" in curr.get_text().lower():
-                        print(f"[CHECK] 見出し隣接要素でFalenchを発見")
-                        return True
-                curr = curr.next_sibling
-                search_count += 1
-
-    # どこにも出演情報として記載されていない場合は False
     return False
 
 
@@ -110,7 +102,7 @@ def fetch_falench_events(notified_urls):
         )
         page = context.new_page()
 
-        # 1. 各ソースからイベント詳細URLを収集
+        # 1. 各ソース（検索結果 ＋ 各主催者一覧ページ）からイベント詳細URLを収集
         for target_url in search_urls:
             print(f"[DEBUG] ページをスキャン中: {target_url}")
             try:
@@ -141,7 +133,7 @@ def fetch_falench_events(notified_urls):
 
         print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidate_urls)}")
 
-        # 2. 各イベントの詳細ページを開き「出演欄」にFalenchがあるか正確に検証
+        # 2. 各イベントの詳細ページを開き「Falench」の出演情報を正確に検証
         for url in candidate_urls:
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
@@ -151,8 +143,8 @@ def fetch_falench_events(notified_urls):
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
 
-                # 出演者欄の限定チェック
-                if is_falench_in_cast(detail_soup):
+                # 正確な文字列順序による出演チェック
+                if is_falench_performing(detail_soup):
                     title_tag = detail_soup.find("h1") or detail_soup.find("title")
                     raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
 
@@ -161,7 +153,7 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    print(f"[MATCH] ★出演者欄にFalench.の出演を確認！: {clean_title} ({url})")
+                    print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
                     new_events.append({"title": clean_title, "url": url})
                 else:
                     print(f"[EXCLUDE] Falench非出演のため除外: {url}")
