@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -8,27 +9,23 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
 CACHE_FILE = "notified_urls.txt"
+ORGANIZERS_FILE = "organizers.json"
 
 # -------------------------------------------------------------------
-# ★ 巡回対象の主催者（販売元）リスト
-# LivePocketの主催者ページURLまたはIDを追加するだけで自動巡回します
+# ★ 主催者リスト（organizers.json）の読み込み関数
 # -------------------------------------------------------------------
-ORGANIZERS = [
-    {
-        "name": "SCOT",
-        "url": "https://livepocket.jp/p/i39be"  # SCOT等の主催者マイページ/イベント一覧URL
-    },
-    # 今後増えた場合はここに追加できます（例）:
-    # {
-    #     "name": "主催者名",
-    #     "url": "https://livepocket.jp/p/xxxx"
-    # },
-]
-
-# 検索キーワード（念のため従来のキーワード検索も併用）
-SEARCH_URLS = [
-    "https://livepocket.jp/event/search?search_word=Falench",
-] + [org["url"] for org in ORGANIZERS]
+def load_organizers():
+    if os.path.exists(ORGANIZERS_FILE):
+        try:
+            with open(ORGANIZERS_FILE, "r", encoding="utf-8") as f:
+                organizers = json.load(f)
+                print(f"[DEBUG] {len(organizers)} 件の主催者を設定ファイルから読み込みました。")
+                return organizers
+        except Exception as e:
+            print(f"[WARN] 設定ファイルの読み込みエラー ({ORGANIZERS_FILE}): {e}")
+    else:
+        print(f"[WARN] {ORGANIZERS_FILE} が見つかりません。デフォルトの検索のみ実行します。")
+    return []
 
 
 def load_notified_urls():
@@ -53,6 +50,14 @@ def fetch_falench_events(notified_urls):
     new_events = []
     candidate_urls = set()
 
+    # 外部ファイルから主催者リストを読み込み
+    organizers = load_organizers()
+
+    # キーワード検索 ＋ 外部リストで指定した主催者URLを結合
+    search_urls = [
+        "https://livepocket.jp/event/search?search_word=Falench",
+    ] + [org["url"] for org in organizers if "url" in org]
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -61,8 +66,8 @@ def fetch_falench_events(notified_urls):
         )
         page = context.new_page()
 
-        # 1. 各ターゲットURL（キーワード検索 ＋ 主催者ページ一覧）から全イベントリンクを収集
-        for target_url in SEARCH_URLS:
+        # 1. 各ターゲットURL（キーワード検索 ＋ 各主催者ページ）から全イベントリンクを収集
+        for target_url in search_urls:
             print(f"[DEBUG] ページをスキャン中: {target_url}")
             try:
                 page.goto(target_url, wait_until="networkidle", timeout=60000)
@@ -74,7 +79,6 @@ def fetch_falench_events(notified_urls):
                 links = soup.find_all("a", href=True)
                 for a_tag in links:
                     href = a_tag["href"]
-                    # イベント詳細のURLパターンを抽出
                     if "/e/" not in href and "/event/detail/" not in href:
                         continue
 
@@ -104,12 +108,10 @@ def fetch_falench_events(notified_urls):
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
                 page_text = detail_soup.get_text(separator=" ", strip=True)
 
-                # ページ本文内に大文字小文字問わず「falench」が含まれるか判定
                 if "falench" in page_text.lower():
                     title_tag = detail_soup.find("h1") or detail_soup.find("title")
                     raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
 
-                    # タイトル整形
                     clean_title = raw_title.replace(" - LivePocket-Ticket-", "").replace("｜LivePocket", "")
                     clean_title = re.sub(r'\s+', ' ', clean_title).strip()
                     if len(clean_title) > 70:
