@@ -6,7 +6,8 @@ from playwright.sync_api import sync_playwright
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-TARGET_URL = "https://livepocket.jp/event/search?search_word=Falench."
+# 出演者（performer）パラメータを使った検索URLに変更
+TARGET_URL = "https://livepocket.jp/event/search?performer=Falench."
 CACHE_FILE = "notified_urls.txt"
 
 def load_notified_urls():
@@ -47,16 +48,14 @@ def fetch_events_with_playwright(notified_urls):
     new_events = []
     seen_urls = set()
 
-    # 1. イベントカード要素を特定（検索結果リスト部分）
-    # LivePocketの検索結果カード枠、または<a>タグを探索
-    cards = soup.select(".event-card, .search-item, .event-list-item, article")
-    
-    # カード要素が見つからない場合は全体の <a> タグから検索
-    if not cards:
-        cards = soup.find_all("a", href=True)
+    # LivePocketの検索結果のイベントカードを抽出
+    # (クラス名: event-card, search-item, .list-item 等)
+    event_items = soup.select(".event-card, .search-item, .event-list-item, li, article")
 
-    for card in cards:
-        a_tag = card if card.name == "a" else card.find("a", href=True)
+    print(f"[DEBUG] 検出された要素数: {len(event_items)}")
+
+    for item in event_items:
+        a_tag = item if item.name == "a" else item.find("a", href=True)
         if not a_tag:
             continue
             
@@ -69,11 +68,13 @@ def fetch_events_with_playwright(notified_urls):
         
         if "/event/search" in clean_url or clean_url in seen_urls:
             continue
-            
-        # カード全体のテキストを取得し、大文字・小文字を区別せず「falench」が含まれるか確認
-        card_text = card.get_text(separator=" ", strip=True)
-        if "falench" not in card_text.lower():
-            print(f"[EXCLUDE] Falenchが含まれないため除外: {clean_url}")
+
+        item_text = item.get_text(separator=" ", strip=True)
+        
+        # --- 出演者判定ロジック ---
+        # 1. 「出演」「performer」「cast」等のキーワード周辺、または要素全体のテキストを取得
+        # 2. 「falench」が含まれているか判定（ドットの有無や大小文字を吸収するため falench で判定）
+        if "falench" not in item_text.lower():
             continue
 
         seen_urls.add(clean_url)
@@ -82,14 +83,14 @@ def fetch_events_with_playwright(notified_urls):
             print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
             continue
         
-        # タイトルの抽出
-        title = a_tag.get_text(strip=True) or card_text[:50]
+        # タイトル文字列の取得・整形
+        title = a_tag.get_text(strip=True) or item_text[:50]
         if len(title) > 60:
             title = title[:60] + "..."
             
         new_events.append({"title": title, "url": clean_url})
         
-    print(f"[DEBUG] 抽出された新着Falench.イベント数: {len(new_events)}")
+    print(f"[DEBUG] 抽出された「Falench.」出演ライブ数: {len(new_events)}")
     return new_events
 
 def send_line_notification(events):
@@ -97,7 +98,7 @@ def send_line_notification(events):
         print("[INFO] 送信する新着イベントがありません。")
         return False
 
-    message_text = "🎉 【Falench.】新しいチケット・イベントが見つかりました！\n\n"
+    message_text = "🎉 【Falench.】出演の新着チケット・ライブ情報が見つかりました！\n\n"
     for event in events:
         message_text += f"📌 {event['title']}\n🔗 {event['url']}\n\n"
 
