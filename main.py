@@ -6,8 +6,7 @@ from playwright.sync_api import sync_playwright
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
-# 出演者（performer）パラメータを使った検索URLに変更
-TARGET_URL = "https://livepocket.jp/event/search?performer=Falench."
+TARGET_URL = "https://livepocket.jp/event/search?search_word=Falench."
 CACHE_FILE = "notified_urls.txt"
 
 def load_notified_urls():
@@ -26,10 +25,35 @@ def save_notified_urls(new_urls, existing_urls):
             f.write(f"{url}\n")
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
+def is_falench_in_detail_page(page, url):
+    """個別イベントページを開き、ページ全体または出演者欄にFalenchが含まれるか確認する"""
+    try:
+        print(f"[DEBUG] 詳細ページを検証中: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_timeout(1000)
+        
+        detail_html = page.content()
+        soup = BeautifulSoup(detail_html, "html.parser")
+        page_text = soup.get_text(separator=" ", strip=True)
+        
+        # 大小文字・ドットの有無を無視して「falench」が含まれるか判定
+        if "falench" in page_text.lower():
+            # H1タグ等から正式なライブタイトルを取得
+            title_tag = soup.find("h1") or soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
+            # 余計なサイト名などを削除
+            title = title.replace(" - LivePocket-Ticket-", "").replace("｜LivePocket", "")
+            return True, title
+    except Exception as e:
+        print(f"[WARN] 詳細ページの読み込みに失敗 ({url}): {e}")
+        
+    return False, ""
+
 def fetch_events_with_playwright(notified_urls):
-    print(f"[DEBUG] Playwrightでページを開きます: {TARGET_URL}")
+    print(f"[DEBUG] Playwrightで検索ページを開きます: {TARGET_URL}")
     
-    html_content = ""
+    candidate_urls = []
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -37,59 +61,51 @@ def fetch_events_with_playwright(notified_urls):
             viewport={'width': 1280, 'height': 800}
         )
         page = context.new_page()
-        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(3000)
         
-        html_content = page.content()
+        # 1. まず検索結果一覧ページを開く
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(2000)
+        
+        search_html = page.content()
+        soup = BeautifulSoup(search_html, "html.parser")
+        
+        # ページ内のイベントURL（/e/ または /event/detail/）をすべて候補として収集
+        links = soup.find_all("a", href=True)
+        seen_urls = set()
+        
+        for a_tag in links:
+            href = a_tag["href"]
+            if "/e/" not in href and "/event/detail/" not in href:
+                continue
+                
+            full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
+            clean_url = full_url.split("?")[0]
+            
+            if "/event/search" in clean_url or clean_url in seen_urls:
+                continue
+                
+            seen_urls.add(clean_url)
+            
+            if clean_url in notified_urls:
+                print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
+                continue
+                
+            candidate_urls.append(clean_url)
+
+        print(f"[DEBUG] 検証対象の未通知イベント候補数: {len(candidate_urls)}")
+
+        # 2. 候補URLを1つずつ開き、Falenchが出演者に含まれるか精査
+        new_events = []
+        for url in candidate_urls:
+            is_target, title = is_falench_in_detail_page(page, url)
+            if is_target:
+                print(f"[MATCH] Falench.の出演を確認！: {title} ({url})")
+                new_events.append({"title": title, "url": url})
+            else:
+                print(f"[EXCLUDE] Falenchが含まれないため除外: {url}")
+
         browser.close()
 
-    soup = BeautifulSoup(html_content, "html.parser")
-    
-    new_events = []
-    seen_urls = set()
-
-    # LivePocketの検索結果のイベントカードを抽出
-    # (クラス名: event-card, search-item, .list-item 等)
-    event_items = soup.select(".event-card, .search-item, .event-list-item, li, article")
-
-    print(f"[DEBUG] 検出された要素数: {len(event_items)}")
-
-    for item in event_items:
-        a_tag = item if item.name == "a" else item.find("a", href=True)
-        if not a_tag:
-            continue
-            
-        href = a_tag["href"]
-        if "/e/" not in href and "/event/detail/" not in href:
-            continue
-            
-        full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
-        clean_url = full_url.split("?")[0]
-        
-        if "/event/search" in clean_url or clean_url in seen_urls:
-            continue
-
-        item_text = item.get_text(separator=" ", strip=True)
-        
-        # --- 出演者判定ロジック ---
-        # 1. 「出演」「performer」「cast」等のキーワード周辺、または要素全体のテキストを取得
-        # 2. 「falench」が含まれているか判定（ドットの有無や大小文字を吸収するため falench で判定）
-        if "falench" not in item_text.lower():
-            continue
-
-        seen_urls.add(clean_url)
-
-        if clean_url in notified_urls:
-            print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
-            continue
-        
-        # タイトル文字列の取得・整形
-        title = a_tag.get_text(strip=True) or item_text[:50]
-        if len(title) > 60:
-            title = title[:60] + "..."
-            
-        new_events.append({"title": title, "url": clean_url})
-        
     print(f"[DEBUG] 抽出された「Falench.」出演ライブ数: {len(new_events)}")
     return new_events
 
@@ -98,7 +114,7 @@ def send_line_notification(events):
         print("[INFO] 送信する新着イベントがありません。")
         return False
 
-    message_text = "🎉 【Falench.】出演の新着チケット・ライブ情報が見つかりました！\n\n"
+    message_text = "🎉 【Falench.】出演のチケット・ライブ情報が見つかりました！\n\n"
     for event in events:
         message_text += f"📌 {event['title']}\n🔗 {event['url']}\n\n"
 
