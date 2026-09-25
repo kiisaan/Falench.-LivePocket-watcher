@@ -31,56 +31,65 @@ def fetch_events_with_playwright(notified_urls):
     html_content = ""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # 一般的なPCブラウザのUser-Agentを設定してブロックを回避
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={'width': 1280, 'height': 800}
         )
         page = context.new_page()
-        
-        # ページにアクセスしてネットワークの読み込みが安定するまで待機
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-        # JavaScriptの非同期レンダリングを考慮して3秒追加待機
         page.wait_for_timeout(3000)
         
         html_content = page.content()
         browser.close()
 
     soup = BeautifulSoup(html_content, "html.parser")
-    links = soup.find_all("a", href=True)
-    print(f"[DEBUG] 取得成功！ ページ内で発見した全リンク数: {len(links)}")
-
+    
     new_events = []
     seen_urls = set()
 
-    for a_tag in links:
+    # 1. イベントカード要素を特定（検索結果リスト部分）
+    # LivePocketの検索結果カード枠、または<a>タグを探索
+    cards = soup.select(".event-card, .search-item, .event-list-item, article")
+    
+    # カード要素が見つからない場合は全体の <a> タグから検索
+    if not cards:
+        cards = soup.find_all("a", href=True)
+
+    for card in cards:
+        a_tag = card if card.name == "a" else card.find("a", href=True)
+        if not a_tag:
+            continue
+            
         href = a_tag["href"]
-        
-        # イベントページのURLパターン（/e/ または /event/detail/）
         if "/e/" not in href and "/event/detail/" not in href:
             continue
             
         full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
         clean_url = full_url.split("?")[0]
         
-        if "/event/search" in clean_url:
+        if "/event/search" in clean_url or clean_url in seen_urls:
+            continue
+            
+        # カード全体のテキストを取得し、大文字・小文字を区別せず「falench」が含まれるか確認
+        card_text = card.get_text(separator=" ", strip=True)
+        if "falench" not in card_text.lower():
+            print(f"[EXCLUDE] Falenchが含まれないため除外: {clean_url}")
             continue
 
-        if clean_url in seen_urls:
-            continue
         seen_urls.add(clean_url)
-        
+
         if clean_url in notified_urls:
             print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
             continue
         
-        title = a_tag.get_text(strip=True) or "Falench. 掲載イベント"
+        # タイトルの抽出
+        title = a_tag.get_text(strip=True) or card_text[:50]
         if len(title) > 60:
             title = title[:60] + "..."
             
         new_events.append({"title": title, "url": clean_url})
         
-    print(f"[DEBUG] 抽出された新着イベント数: {len(new_events)}")
+    print(f"[DEBUG] 抽出された新着Falench.イベント数: {len(new_events)}")
     return new_events
 
 def send_line_notification(events):
