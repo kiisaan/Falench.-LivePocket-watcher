@@ -1,11 +1,14 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
-import re
+from playwright.sync_api import sync_playwright
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
+# 検索ワード「Falench」で検索ページを指定
+SEARCH_URL = "https://livepocket.jp/event/search?search_word=Falench"
 CACHE_FILE = "notified_urls.txt"
 
 def load_notified_urls():
@@ -25,88 +28,82 @@ def save_notified_urls(new_urls, existing_urls):
     print(f"[DEBUG] キャッシュに合計 {len(all_urls)} 件保存しました。")
 
 def fetch_falench_events(notified_urls):
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    })
-
-    # トップページに事前アクセスしてCookie・セッションを確立
-    try:
-        session.get("https://livepocket.jp/", timeout=10)
-    except Exception as e:
-        print(f"[WARN] セッション初期化失敗: {e}")
-
     new_events = []
-    seen_urls = set()
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={'width': 1280, 'height': 800}
+        )
+        page = context.new_page()
 
-    # 最大3ページまで検索結果を巡回
-    for page in range(1, 4):
-        search_url = f"https://livepocket.jp/event/search?search_word=Falench&page={page}"
-        print(f"[DEBUG] 検索ページを取得中 (Page {page}): {search_url}")
-        
-        try:
-            res = session.get(search_url, timeout=15)
-            res.raise_for_status()
-        except Exception as e:
-            print(f"[ERROR] ページ取得エラー (Page {page}): {e}")
-            break
+        print(f"[DEBUG] 検索ページをPlaywrightで描画中: {SEARCH_URL}")
+        page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(3000) # JSの描画完了まで待機
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        # LivePocketの検索結果カード要素を取得（複数のHTML構造に対応）
-        cards = soup.select(".event-card, .search-item, .event-list-item, li, article, .box-event")
-        
-        # カード要素が特定できない場合は /e/ または /event/detail/ を含むaタグを直接取得
-        if not cards:
-            cards = soup.find_all("a", href=True)
+        html_content = page.content()
+        soup = BeautifulSoup(html_content, "html.parser")
 
-        found_in_page = 0
+        # ページ内のイベントURL (/e/ または /event/detail/) を抽出
+        links = soup.find_all("a", href=True)
+        candidate_urls = []
+        seen_urls = set()
 
-        for card in cards:
-            a_tag = card if card.name == "a" else card.find("a", href=True)
-            if not a_tag or not a_tag.get("href"):
-                continue
-                
+        for a_tag in links:
             href = a_tag["href"]
             if "/e/" not in href and "/event/detail/" not in href:
                 continue
-                
+
             full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
             clean_url = full_url.split("?")[0]
-            
+
             if "/event/search" in clean_url or clean_url in seen_urls:
                 continue
 
-            card_text = card.get_text(separator=" ", strip=True)
-            
-            # 「falench」という文字（大文字・小文字不問）が含まれているかチェック
-            if "falench" not in card_text.lower():
-                continue
-
             seen_urls.add(clean_url)
-            found_in_page += 1
 
             if clean_url in notified_urls:
                 print(f"[SKIP] 通知済みのためスキップ: {clean_url}")
                 continue
 
-            # タイトルの整形
-            title = a_tag.get_text(strip=True) or card_text[:50]
-            # 改行や連続スペースを整形
-            title = re.sub(r'\s+', ' ', title).strip()
-            if len(title) > 70:
-                title = title[:70] + "..."
-                
-            print(f"[MATCH] 該当ライブを発見: {title} ({clean_url})")
-            new_events.append({"title": title, "url": clean_url})
+            candidate_urls.append(clean_url)
 
-        # ページ内に該当カードが0件になったら巡回終了
-        if found_in_page == 0 and page > 1:
-            break
+        print(f"[DEBUG] 発見した未通知イベント候補数: {len(candidate_urls)}")
 
-    print(f"[DEBUG] 抽出された「Falench.」出演ライブ合計数: {len(new_events)}")
+        # 各イベント詳細ページに直接アクセスしてFalenchが出演しているか検証
+        for url in candidate_urls:
+            try:
+                print(f"[DEBUG] イベント詳細を検証中: {url}")
+                page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(1000)
+
+                detail_html = page.content()
+                detail_soup = BeautifulSoup(detail_html, "html.parser")
+                page_text = detail_soup.get_text(separator=" ", strip=True)
+
+                # 「falench」というテキストが詳細ページに含まれているかチェック
+                if "falench" in page_text.lower():
+                    title_tag = detail_soup.find("h1") or detail_soup.find("title")
+                    raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
+                    
+                    # サイト名などを削って整形
+                    clean_title = raw_title.replace(" - LivePocket-Ticket-", "").replace("｜LivePocket", "")
+                    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+                    if len(clean_title) > 70:
+                        clean_title = clean_title[:70] + "..."
+
+                    print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
+                    new_events.append({"title": clean_title, "url": url})
+                else:
+                    print(f"[EXCLUDE] Falench非出演のため除外: {url}")
+
+            except Exception as e:
+                print(f"[WARN] ページ検証エラー ({url}): {e}")
+
+        browser.close()
+
+    print(f"[DEBUG] 最終抽出された「Falench.」出演ライブ数: {len(new_events)}")
     return new_events
 
 def send_line_notification(events):
@@ -132,11 +129,11 @@ def send_line_notification(events):
             }
         ]
     }
-    
+
     res = requests.post(endpoint, json=payload, headers=headers)
     print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
     print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
-    
+
     if res.status_code == 200:
         print("[SUCCESS] LINEへの通知が成功しました！")
         return True
@@ -147,7 +144,7 @@ def send_line_notification(events):
 if __name__ == "__main__":
     notified_urls = load_notified_urls()
     new_events = fetch_falench_events(notified_urls)
-    
+
     if new_events:
         success = send_line_notification(new_events)
         if success:
