@@ -46,38 +46,49 @@ def save_notified_urls(new_urls, existing_urls):
 
 def is_falench_in_cast(soup):
     """
-    出演者情報セクション（または概要本文）の中に限定して Falench が記載されているか厳密判定する関数
-    おすすめイベント枠やフッターなどの誤検知を防止します
+    出演者情報セクション（または「出演」「CAST」見出しの直下）に限定して
+    Falench が記載されているか厳密判定する関数
     """
-    # 1. LivePocketの「出演者」要素を直接ターゲット取得
-    cast_elements = soup.select(".cast, .performer, .artist, .event-cast, #cast")
-    
-    # 見つかった要素内から文字列を検証
+    # 1. ノイズとなる領域（関連イベント・注意事項・フッター・ヘッダー・モーダル）をあらかじめ削除
+    for unwanted in soup.select(
+        ".recommend, .other-events, .related-events, footer, .sidebar, #header, "
+        ".modal, .notice, .attention, .faq, .ticket-info, #ticket-info"
+    ):
+        unwanted.decompose()
+
+    # 2. LivePocketの指定クラス（出演者欄）をピンポイント取得
+    cast_elements = soup.select(".cast, .performer, .artist, .event-cast, #cast, .cast-list")
     for elem in cast_elements:
         if "falench" in elem.get_text().lower():
+            print(f"[CHECK] クラス判定でFalenchを発見: {elem.get_text()[:30]}")
             return True
 
-    # 2. クラス名で取得できない場合、「出演」「CAST」「出演者」の見出し周辺のテキストを検索
-    for h_tag in soup.find_all(["h2", "h3", "h4", "dt", "th", "strong"]):
-        text = h_tag.get_text().strip()
-        if any(keyword in text for keyword in ["出演", "CAST", "Cast", "出演者", "ARTIST", "Artist"]):
-            # 見出しの親要素または次の要素（dd, td, divなど）を取得
+    # 3. 「出演」「CAST」「ARTIST」などの見出し要素を探し、その配下・直後のテキストのみを検証
+    keywords = ["出演", "cast", "artist", "出演者", "パーソナリティ"]
+    
+    for h_tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "dt", "th", "strong", "p", "div"]):
+        tag_text = h_tag.get_text().strip().lower()
+        
+        # 見出し自体が「出演」や「CAST」などのキーワードを含んでいるか判定
+        if any(kw == tag_text or kw in tag_text for kw in keywords):
+            # ① 見出しタグの親要素の中身をチェック
             parent = h_tag.parent
             if parent and "falench" in parent.get_text().lower():
-                return True
-            next_sibling = h_tag.find_next_sibling()
-            if next_sibling and "falench" in next_sibling.get_text().lower():
+                print(f"[CHECK] 見出し親要素でFalenchを発見")
                 return True
 
-    # 3. 予備判定: イベント本文（description）の中に記載があるか確認
-    # ※おすすめイベントなどの領域（.recommend, .other-events, footer等）を除外して本文から検索
-    for unwanted in soup.select(".recommend, .other-events, .related-events, footer, .sidebar, #header"):
-        unwanted.decompose() # 関連イベント等のDOMを完全破棄
+            # ② 見出しタグの「次のお兄さん・弟要素（Sibling）」をチェック
+            curr = h_tag.next_sibling
+            search_count = 0
+            while curr and search_count < 3:
+                if hasattr(curr, "get_text"):
+                    if "falench" in curr.get_text().lower():
+                        print(f"[CHECK] 見出し隣接要素でFalenchを発見")
+                        return True
+                curr = curr.next_sibling
+                search_count += 1
 
-    body_text = soup.get_text(separator=" ", strip=True)
-    if "falench" in body_text.lower():
-        return True
-
+    # どこにも出演情報として記載されていない場合は False
     return False
 
 
@@ -140,7 +151,7 @@ def fetch_falench_events(notified_urls):
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
 
-                # 出演者欄厳密チェック関数を実行
+                # 出演者欄の限定チェック
                 if is_falench_in_cast(detail_soup):
                     title_tag = detail_soup.find("h1") or detail_soup.find("title")
                     raw_title = title_tag.get_text(strip=True) if title_tag else "Falench. 出演ライブ"
@@ -153,7 +164,7 @@ def fetch_falench_events(notified_urls):
                     print(f"[MATCH] ★出演者欄にFalench.の出演を確認！: {clean_title} ({url})")
                     new_events.append({"title": clean_title, "url": url})
                 else:
-                    print(f"[EXCLUDE] Falench非出演（または関連枠の表示）のため除外: {url}")
+                    print(f"[EXCLUDE] Falench非出演のため除外: {url}")
 
             except Exception as e:
                 print(f"[WARN] 詳細検証失敗 ({url}): {e}")
