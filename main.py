@@ -49,7 +49,6 @@ def is_falench_performing(soup):
     イベント詳細ページの「メイン本文エリア」内にのみ
     Falench が出演者として記載されているか高精度に判定する関数
     """
-    # 複製したsoupを作成してノイズ除去（判定用のみ）
     soup_copy = BeautifulSoup(str(soup), "html.parser")
     for unwanted in soup_copy.select(
         ".recommend, .other-events, .related-events, footer, header, #header, "
@@ -81,71 +80,108 @@ def is_falench_performing(soup):
 
 def extract_event_details_from_page(page):
     """
-    Playwrightで描画されたLivePocketのリアルDOM構造から
-    開催日程とチケット販売期間を正確に抽出する関数
+    Playwrightで完全にレンダリングされたLivePocketのDOMから
+    日程と販売期間を強固に取得する関数
     """
+    # 画面下部までスクロールしてJSの遅延読み込みを完了させる
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
     details = page.evaluate("""() => {
         let dateStr = "";
         let salesStr = "";
 
-        // 1. 開催日程の取得
-        // LivePocketの概要セクション (.event-outline, .event_info, .date, dlなど)
-        const dateElements = document.querySelectorAll('.date, .event-date, dl, .event-info');
-        for (let el of dateElements) {
-            const text = el.innerText || "";
-            if (text.includes("日程") || text.includes("日時") || text.includes("開催")) {
-                const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i].includes("日程") || lines[i].includes("日時") || lines[i].includes("開催")) {
-                        if (lines[i + 1]) {
-                            dateStr = lines[i + 1];
-                        } else {
-                            dateStr = lines[i];
-                        }
-                        break;
-                    }
+        // ----- 1. 日程の抽出 -----
+        // 優先セレクター
+        const dateSelectors = [
+            '#event_date', '.event_date', '.event-date', '.date',
+            '.schedule', '.event-time', '.event_time'
+        ];
+        for (let sel of dateSelectors) {
+            const el = document.querySelector(sel);
+            if (el && el.innerText.strip) {
+                const text = el.innerText.trim();
+                if (text && text.length < 120 && text.match(/\\d{1,2}[\\/\\.-]\\d{1,2}|\\d{4}/)) {
+                    dateStr = text;
+                    break;
                 }
             }
-            if (dateStr) break;
         }
 
-        // バックアップ：日付（202x/xx/xx や 202x年xx月xx日）形式を直接検索
+        // 定義リスト（dl/dt/dd）から「日時」「日程」「開催」を検索
         if (!dateStr) {
-            const bodyText = document.body.innerText;
-            const dateMatch = bodyText.match(/(\\d{4}[\\/\\.-]\\d{1,2}[\\/\\.-]\\d{1,2}\\s*\\(?[^\\)]*\\)?\\s*\\d{1,2}:\\d{2}~?)/);
-            if (dateMatch) {
-                dateStr = dateMatch[1];
+            const dls = document.querySelectorAll('dl, tr, div');
+            for (let el of dls) {
+                const text = el.innerText || "";
+                if ((text.includes("日時") || text.includes("日程") || text.includes("開催日")) && text.match(/\\d{1,2}[\\/\\.-]\\d{1,2}|\\d{4}/)) {
+                    const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].includes("日時") || lines[i].includes("日程") || lines[i].includes("開催日")) {
+                            dateStr = lines.slice(i, i + 2).join(" ");
+                            break;
+                        }
+                    }
+                    if (dateStr) break;
+                }
             }
         }
 
-        // 2. チケット販売期間の取得
-        // LivePocketのチケット枠 (.ticket-list, .ticket-info, .ticket-item, .ticket_areaなど)
-        const ticketPeriods = [];
-        const ticketElements = document.querySelectorAll('.ticket-list li, .ticket-item, .ticket-info, .ticket_area');
+        // 全体テキストからのフォールバック（日付＋時間のパターン）
+        if (!dateStr) {
+            const bodyText = document.body.innerText;
+            const match = bodyText.match(/(\\d{4}[\\/\\.-]\\d{1,2}[\\/\\.-]\\d{1,2}\\s*\\(?[^\\)\\n]*\\)?\\s*\\d{1,2}:\\d{2}~?)/);
+            if (match) {
+                dateStr = match[1];
+            }
+        }
 
-        ticketElements.forEach(el => {
-            const text = el.innerText || "";
-            if (text.includes("販売") || text.includes("受付") || text.includes("～") || text.includes("~")) {
-                const lines = text.split('\\n').map(l => l.trim());
-                for (let line of lines) {
-                    if ((line.includes("～") || line.includes("~") || line.includes("販売") || line.includes("受付")) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}/)) {
-                        if (!ticketPeriods.includes(line)) {
-                            ticketPeriods.push(line);
-                        }
-                    }
+        // ----- 2. 販売期間の抽出 -----
+        const ticketPeriods = [];
+
+        // LivePocketのチケット枠クラス（.period, .sale_period, .ticket_period, .sale-period等）
+        const periodElements = document.querySelectorAll('.period, .sale_period, .sales_period, .ticket_period, .sale-period, .sales-period, .ticket-period, [class*="period"]');
+        
+        periodElements.forEach(el => {
+            const text = (el.innerText || "").trim();
+            if (text && (text.includes("～") || text.includes("~") || text.match(/\\d{1,2}[\\/\\.-]\\d{1,2}/))) {
+                if (!ticketPeriods.includes(text) && text.length < 150) {
+                    ticketPeriods.push(text);
                 }
             }
         });
 
+        // チケットリスト全体ブロックからのテキスト走査
+        if (ticketPeriods.length === 0) {
+            const ticketBoxes = document.querySelectorAll('.ticket-list, .ticket_info, .ticket-info, .ticket-item, #ticket_area, .ticket');
+            ticketBoxes.forEach(box => {
+                const lines = box.innerText.split('\\n').map(l => l.trim());
+                for (let line of lines) {
+                    if ((line.includes("販売") || line.includes("受付") || line.includes("～") || line.includes("~")) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}/)) {
+                        if (!ticketPeriods.includes(line) && line.length < 150) {
+                            ticketPeriods.push(line);
+                        }
+                    }
+                }
+            });
+        }
+
+        // 全体テキストからの最終フォールバック
+        if (ticketPeriods.length === 0) {
+            const bodyText = document.body.innerText;
+            const lines = bodyText.split('\\n').map(l => l.trim());
+            for (let line of lines) {
+                if ((line.includes("販売期間") || line.includes("受付期間") || line.includes("申込期間")) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}/)) {
+                    ticketPeriods.push(line);
+                    break;
+                }
+            }
+        }
+
         if (ticketPeriods.length > 0) {
             salesStr = ticketPeriods.join(" / ");
-        } else {
-            // バックアップ：全体テキストから販売期間らしき行を検索
-            const bodyText = document.body.innerText;
-            const periodMatch = bodyText.match(/(\\d{4}[\\/\\.-]\\d{1,2}.*?(?:～|~|-).*?\\d{4}[\\/\\.-]\\d{1,2}.*?)(?=\\n|$)/);
-            if (periodMatch) {
-                salesStr = periodMatch[1];
-            }
         }
 
         return {
@@ -157,7 +193,7 @@ def extract_event_details_from_page(page):
     event_date = details.get("event_date") or "要確認（詳細ページ参照）"
     sales_period = details.get("sales_period") or "要確認（詳細ページ参照）"
 
-    # 改行や連続スペースの整形
+    # 改行や複数スペースの整形
     event_date = re.sub(r'\s+', ' ', event_date)
     sales_period = re.sub(r'\s+', ' ', sales_period)
 
@@ -217,8 +253,8 @@ def fetch_falench_events(notified_urls):
         for url in candidate_urls:
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
-                page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(2000)  # JS描写完了の確実な待機
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                page.wait_for_timeout(3000)  # JSレンダリング完了を確実にするため3秒待機
 
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
@@ -232,7 +268,7 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    # LivePocketページのリアルDOMから日程・販売期間を抽出
+                    # DOM解析で日程・販売期間を確実に抽出
                     event_date, sales_period = extract_event_details_from_page(page)
 
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
@@ -273,7 +309,7 @@ def send_line_notification(events):
 
     endpoint = "https://api.line.me/v2/bot/message/push"
     headers = {
-        "Content-Type": "Authorization",
+        "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
     payload = {
@@ -286,7 +322,7 @@ def send_line_notification(events):
         ]
     }
 
-    res = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"})
+    res = requests.post(endpoint, json=payload, headers=headers)
     print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
     print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
 
