@@ -49,7 +49,9 @@ def is_falench_performing(soup):
     イベント詳細ページの「メイン本文エリア」内にのみ
     Falench が出演者として記載されているか高精度に判定する関数
     """
-    for unwanted in soup.select(
+    # 複製したsoupを作成してノイズ除去（判定用のみ）
+    soup_copy = BeautifulSoup(str(soup), "html.parser")
+    for unwanted in soup_copy.select(
         ".recommend, .other-events, .related-events, footer, header, #header, "
         ".sidebar, .other-event-list, .recommend-event, .seller-event, "
         "[class*='recommend'], [class*='other'], [id*='recommend'], [id*='other']"
@@ -58,12 +60,12 @@ def is_falench_performing(soup):
 
     pattern = re.compile(r'falench(?:\.|\b)', re.IGNORECASE)
 
-    title_element = soup.find("h1") or soup.find("title")
+    title_element = soup_copy.find("h1") or soup_copy.find("title")
     if title_element and pattern.search(title_element.get_text()):
         return True
 
-    main_content = soup.select_one("#event-detail, .event-detail, .main-content, #main")
-    target_soup = main_content if main_content else soup
+    main_content = soup_copy.select_one("#event-detail, .event-detail, .main-content, #main")
+    target_soup = main_content if main_content else soup_copy
 
     blocks = target_soup.find_all(["div", "p", "li", "td", "span", "dd", "dt"])
 
@@ -77,78 +79,89 @@ def is_falench_performing(soup):
     return False
 
 
-def extract_event_details(page, soup):
+def extract_event_details_from_page(page):
     """
-    Playwright要素指定 ＋ BeautifulSoup構造解析による高度な日程・販売期間抽出
+    Playwrightで描画されたLivePocketのリアルDOM構造から
+    開催日程とチケット販売期間を正確に抽出する関数
     """
-    event_date = None
-    sales_period = None
+    details = page.evaluate("""() => {
+        let dateStr = "";
+        let salesStr = "";
 
-    # 1. Playwrightのセレクターを用いて LivePocket 特有の要素からダイレクト抽出
-    try:
-        # 開催日程の代表的なLivePocket要素セレクター
-        date_selectors = [
-            ".event_date", ".date", ".event-date", ".event-time", ".event_time",
-            ".schedule", ".event_schedule", "#event_date", ".event_detail_date"
-        ]
-        for sel in date_selectors:
-            elem = page.query_selector(sel)
-            if elem:
-                txt = elem.inner_text().strip()
-                if txt and len(txt) < 100:
-                    event_date = re.sub(r'\s+', ' ', txt)
-                    break
+        // 1. 開催日程の取得
+        // LivePocketの概要セクション (.event-outline, .event_info, .date, dlなど)
+        const dateElements = document.querySelectorAll('.date, .event-date, dl, .event-info');
+        for (let el of dateElements) {
+            const text = el.innerText || "";
+            if (text.includes("日程") || text.includes("日時") || text.includes("開催")) {
+                const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].includes("日程") || lines[i].includes("日時") || lines[i].includes("開催")) {
+                        if (lines[i + 1]) {
+                            dateStr = lines[i + 1];
+                        } else {
+                            dateStr = lines[i];
+                        }
+                        break;
+                    }
+                }
+            }
+            if (dateStr) break;
+        }
 
-        # 販売期間の代表的なLivePocket要素セレクター
-        sales_selectors = [
-            ".sale_period", ".sales_period", ".ticket_period", ".ticket_sale_period",
-            ".sale-period", ".sales-period", ".ticket-period", ".ticket_info .period"
-        ]
-        for sel in sales_selectors:
-            elem = page.query_selector(sel)
-            if elem:
-                txt = elem.inner_text().strip()
-                if txt and len(txt) < 150:
-                    sales_period = re.sub(r'\s+', ' ', txt)
-                    break
-    except Exception as e:
-        print(f"[WARN] セレクター直接取得時の警告: {e}")
+        // バックアップ：日付（202x/xx/xx や 202x年xx月xx日）形式を直接検索
+        if (!dateStr) {
+            const bodyText = document.body.innerText;
+            const dateMatch = bodyText.match(/(\\d{4}[\\/\\.-]\\d{1,2}[\\/\\.-]\\d{1,2}\\s*\\(?[^\\)]*\\)?\\s*\\d{1,2}:\\d{2}~?)/);
+            if (dateMatch) {
+                dateStr = dateMatch[1];
+            }
+        }
 
-    # 2. セレクターで取得できなかった場合のテキスト解析補完 (BeautifulSoup)
-    if not event_date or not sales_period:
-        full_text = soup.get_text(separator="\n", strip=True)
+        // 2. チケット販売期間の取得
+        // LivePocketのチケット枠 (.ticket-list, .ticket-info, .ticket-item, .ticket_areaなど)
+        const ticketPeriods = [];
+        const ticketElements = document.querySelectorAll('.ticket-list li, .ticket-item, .ticket-info, .ticket_area');
 
-        # 開催日程の正規表現パターン（例: 2026/10/05(月) 開場 18:00 / 開演 18:30）
-        if not event_date:
-            date_match = re.search(
-                r'(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}\s*\(?[\u4e00-\u9fa5]?\)?.*?(?:開演|開場|開式|Start|START|\d{1,2}:\d{2}))',
-                full_text
-            )
-            if date_match:
-                event_date = date_match.group(1).replace("\n", " ").strip()
-            else:
-                # 簡易日付パターン
-                simple_date = re.search(r'(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}\s*\(?[\u4e00-\u9fa5]?\)?\s*\d{1,2}:\d{2})', full_text)
-                if simple_date:
-                    event_date = simple_date.group(1).strip()
+        ticketElements.forEach(el => {
+            const text = el.innerText || "";
+            if (text.includes("販売") || text.includes("受付") || text.includes("～") || text.includes("~")) {
+                const lines = text.split('\\n').map(l => l.trim());
+                for (let line of lines) {
+                    if ((line.includes("～") || line.includes("~") || line.includes("販売") || line.includes("受付")) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}/)) {
+                        if (!ticketPeriods.includes(line)) {
+                            ticketPeriods.push(line);
+                        }
+                    }
+                }
+            }
+        });
 
-        # チケット販売期間の正規表現パターン（例: 2026/09/20(日) 20:00 ～ 2026/10/04(日) 23:59）
-        if not sales_period:
-            period_match = re.search(
-                r'(\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}.*?(?:～|~|-|→).*?\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2}.*?)(?=\n|$)',
-                full_text
-            )
-            if period_match:
-                sales_period = period_match.group(1).replace("\n", " ").strip()
-            else:
-                # 「販売期間」「受付期間」といったキーワードを含む行をピンポイント取得
-                for line in full_text.split("\n"):
-                    if any(kw in line for kw in ["販売期間", "受付期間", "申込期間"]):
-                        if len(line) < 150:
-                            sales_period = line.strip()
-                            break
+        if (ticketPeriods.length > 0) {
+            salesStr = ticketPeriods.join(" / ");
+        } else {
+            // バックアップ：全体テキストから販売期間らしき行を検索
+            const bodyText = document.body.innerText;
+            const periodMatch = bodyText.match(/(\\d{4}[\\/\\.-]\\d{1,2}.*?(?:～|~|-).*?\\d{4}[\\/\\.-]\\d{1,2}.*?)(?=\\n|$)/);
+            if (periodMatch) {
+                salesStr = periodMatch[1];
+            }
+        }
 
-    return event_date or "要確認（詳細ページ参照）", sales_period or "要確認（詳細ページ参照）"
+        return {
+            event_date: dateStr.trim(),
+            sales_period: salesStr.trim()
+        };
+    }""")
+
+    event_date = details.get("event_date") or "要確認（詳細ページ参照）"
+    sales_period = details.get("sales_period") or "要確認（詳細ページ参照）"
+
+    # 改行や連続スペースの整形
+    event_date = re.sub(r'\s+', ' ', event_date)
+    sales_period = re.sub(r'\s+', ' ', sales_period)
+
+    return event_date, sales_period
 
 
 def fetch_falench_events(notified_urls):
@@ -205,7 +218,7 @@ def fetch_falench_events(notified_urls):
             try:
                 print(f"[DEBUG] イベント詳細を検証中: {url}")
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(2000)  # JSレンダリング完了の確定待ち
+                page.wait_for_timeout(2000)  # JS描写完了の確実な待機
 
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
@@ -219,8 +232,8 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    # Playwrightの要素操作とBeautifulSoupを組み合わせて抽出
-                    event_date, sales_period = extract_event_details(page, detail_soup)
+                    # LivePocketページのリアルDOMから日程・販売期間を抽出
+                    event_date, sales_period = extract_event_details_from_page(page)
 
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
                     print(f"       📅 日程: {event_date}")
@@ -260,7 +273,7 @@ def send_line_notification(events):
 
     endpoint = "https://api.line.me/v2/bot/message/push"
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "Authorization",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
     payload = {
@@ -273,7 +286,7 @@ def send_line_notification(events):
         ]
     }
 
-    res = requests.post(endpoint, json=payload, headers=headers)
+    res = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"})
     print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
     print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
 
