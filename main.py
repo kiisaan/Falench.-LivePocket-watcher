@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -12,6 +14,9 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 CACHE_FILE = "notified_urls.txt"
 ORGANIZERS_FILE = "organizers.json"
+CHECKED_FILE = "checked_urls.json"  # 「Falench.非出演」と判定済みのURL（再検証の省略用）
+RECHECK_DAYS = 3                    # 非出演と判定したURLを再検証するまでの日数
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))  # 詳細ページの並列数
 DEBUG_DIR = "debug_pages"  # 抽出に失敗したページのテキスト/HTMLを保存する場所
 
 UNKNOWN = "要確認（詳細ページ参照）"
@@ -355,18 +360,19 @@ def _dump_debug(url, body_text, html):
         print(f"[WARN] デバッグ保存失敗: {e}")
 
 
-def extract_event_details_from_page(page, url=""):
+def extract_event_details_from_page(page, url="", scroll=False):
     """
     LivePocketのイベント詳細ページから【開催日時】と【販売期間】を抽出する。
     """
-    # 遅延描画される要素を読み込ませる
-    try:
-        for ratio in (1 / 3, 2 / 3, 1):
-            page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {ratio});")
-            page.wait_for_timeout(600)
-        page.wait_for_timeout(800)
-    except Exception:
-        pass
+    # 通常はスクロール不要（サーバー描画済み）。取れなかった場合のみ、再試行時にスクロールする
+    if scroll:
+        try:
+            for ratio in (1 / 3, 2 / 3, 1):
+                page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {ratio});")
+                page.wait_for_timeout(300)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
 
     try:
         body_text = page.inner_text("body")
@@ -411,6 +417,9 @@ def extract_event_details_from_page(page, url=""):
     if not sales_period:
         sales_period = ld["sales"]
 
+    if (not event_date or not sales_period) and not scroll:
+        return extract_event_details_from_page(page, url, scroll=True)
+
     if not event_date or not sales_period:
         print(f"[DEBUG] 抽出不足 date={bool(event_date)} sales={bool(sales_period)} → ダンプ保存")
         _dump_debug(url, body_text, html)
@@ -418,64 +427,89 @@ def extract_event_details_from_page(page, url=""):
     return (event_date or UNKNOWN), (sales_period or UNKNOWN)
 
 
-def fetch_falench_events(notified_urls):
-    new_events = []
-    candidate_urls = set()
+# 不要なリソース（画像・フォント・計測/広告/翻訳スクリプト）は読み込まない
+BLOCK_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCK_URL_KEYWORDS = (
+    "googletagmanager.com", "google-analytics.com", "doubleclick.net", "googlesyndication.com",
+    "facebook.net", "facebook.com/tr", "wovn.io", "clarity.ms", "hotjar.com",
+    "ads-twitter.com", "analytics.twitter.com", "adsrvr.org", "criteo",
+)
 
-    organizers = load_organizers()
 
-    search_urls = [
-        "https://livepocket.jp/event/search?search_word=Falench",
-    ] + [org["url"] for org in organizers if "url" in org]
+def _route_handler(route):
+    req = route.request
+    if req.resource_type in BLOCK_RESOURCE_TYPES or any(k in req.url for k in BLOCK_URL_KEYWORDS):
+        route.abort()
+    else:
+        route.continue_()
+
+
+def _new_context(p):
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        viewport={'width': 1280, 'height': 800},
+        locale="ja-JP",
+        timezone_id="Asia/Tokyo",
+        extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
+    )
+    context.route("**/*", _route_handler)
+    return browser, context
+
+
+def load_checked_urls():
+    if os.path.exists(CHECKED_FILE):
+        try:
+            with open(CHECKED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"[WARN] {CHECKED_FILE} の読み込みエラー: {e}")
+    return {}
+
+
+def is_recently_checked(url, checked):
+    d = checked.get(url)
+    if not d:
+        return False
+    try:
+        return (date.today() - date.fromisoformat(d)).days < RECHECK_DAYS
+    except Exception:
+        return False
+
+
+def save_checked_urls(checked):
+    today = date.today()
+    pruned = {}
+    for url, d in checked.items():
+        try:
+            if (today - date.fromisoformat(d)).days <= 30:  # 古い記録は捨てる
+                pruned[url] = d
+        except Exception:
+            pass
+    with open(CHECKED_FILE, "w", encoding="utf-8") as f:
+        json.dump(dict(sorted(pruned.items())), f, ensure_ascii=False, indent=0)
+    print(f"[DEBUG] 非出演キャッシュに {len(pruned)} 件保存しました。")
+
+
+def _check_urls_worker(urls):
+    """1スレッド = 1ブラウザで、担当URLを順に検証する。戻り値: (出演イベント, 非出演と確定したURL)"""
+    events, excluded = [], []
+    if not urls:
+        return events, excluded
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800},
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo",
-            extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
-        )
+        browser, context = _new_context(p)
         page = context.new_page()
 
-        # 1. 各ソースからイベント詳細URLを収集
-        for target_url in search_urls:
-            print(f"[DEBUG] ページをスキャン中: {target_url}")
+        for url in urls:
             try:
-                page.goto(target_url, wait_until="networkidle", timeout=60000)
-                page.wait_for_timeout(2000)
-
-                html_content = page.content()
-                soup = BeautifulSoup(html_content, "html.parser")
-
-                links = soup.find_all("a", href=True)
-                for a_tag in links:
-                    href = a_tag["href"]
-                    if "/e/" not in href and "/event/detail/" not in href:
-                        continue
-
-                    full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
-                    clean_url = full_url.split("?")[0]
-
-                    if "/event/search" in clean_url:
-                        continue
-
-                    if clean_url in notified_urls:
-                        continue
-
-                    candidate_urls.add(clean_url)
-            except Exception as e:
-                print(f"[WARN] スキャン失敗 ({target_url}): {e}")
-
-        print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidate_urls)}")
-
-        # 2. 各イベントの詳細ページを開き検証・情報抽出
-        for url in candidate_urls:
-            try:
-                print(f"[DEBUG] イベント詳細を検証中: {url}")
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                page.wait_for_timeout(2000)
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_selector("h1", timeout=8000)
+                except Exception:
+                    pass
 
                 detail_html = page.content()
                 detail_soup = BeautifulSoup(detail_html, "html.parser")
@@ -489,28 +523,108 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    # イベント詳細（開催日時・販売期間）を抽出
                     event_date, sales_period = extract_event_details_from_page(page, url)
 
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
                     print(f"       📅 日程: {event_date}")
                     print(f"       🎟 販売期間: {sales_period}")
 
-                    new_events.append({
+                    events.append({
                         "title": clean_title,
                         "url": url,
                         "date": event_date,
-                        "sales_period": sales_period
+                        "sales_period": sales_period,
                     })
                 else:
                     print(f"[EXCLUDE] Falench非出演のため除外: {url}")
+                    # ページが正常に読めた(h1がある)場合のみ「非出演」を記録する
+                    if detail_soup.find("h1"):
+                        excluded.append(url)
 
             except Exception as e:
                 print(f"[WARN] 詳細検証失敗 ({url}): {e}")
 
         browser.close()
 
-    print(f"[DEBUG] 最終抽出された「Falench.」出演ライブ数: {len(new_events)}")
+    return events, excluded
+
+
+def fetch_falench_events(notified_urls):
+    t_start = time.time()
+    candidate_urls = set()
+    checked = load_checked_urls()
+    skipped_checked = 0
+
+    organizers = load_organizers()
+
+    search_urls = [
+        "https://livepocket.jp/event/search?search_word=Falench",
+    ] + [org["url"] for org in organizers if "url" in org]
+
+    # 1. 各ソースからイベント詳細URLを収集
+    with sync_playwright() as p:
+        browser, context = _new_context(p)
+        page = context.new_page()
+
+        for target_url in search_urls:
+            print(f"[DEBUG] ページをスキャン中: {target_url}")
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_selector('a[href*="/e/"], a[href*="/event/detail/"]', timeout=10000)
+                except Exception:
+                    pass
+
+                soup = BeautifulSoup(page.content(), "html.parser")
+
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if "/e/" not in href and "/event/detail/" not in href:
+                        continue
+
+                    full_url = href if href.startswith("http") else f"https://livepocket.jp{href}"
+                    clean_url = full_url.split("?")[0]
+
+                    if "/event/search" in clean_url:
+                        continue
+                    if clean_url in notified_urls:
+                        continue
+                    if is_recently_checked(clean_url, checked):
+                        skipped_checked += 1
+                        continue
+
+                    candidate_urls.add(clean_url)
+            except Exception as e:
+                print(f"[WARN] スキャン失敗 ({target_url}): {e}")
+
+        browser.close()
+
+    candidates = sorted(candidate_urls)
+    print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidates)}"
+          f"（非出演キャッシュで省略: {skipped_checked} 件）  [{time.time() - t_start:.1f}s]")
+
+    # 2. 詳細ページを並列に検証・情報抽出
+    new_events = []
+    excluded_all = []
+    if candidates:
+        n = max(1, min(MAX_WORKERS, len(candidates)))
+        chunks = [candidates[i::n] for i in range(n)]  # ラウンドロビンで均等に分ける
+        print(f"[DEBUG] {n} 並列で詳細ページを検証します。")
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            for events, excluded in ex.map(_check_urls_worker, chunks):
+                new_events.extend(events)
+                excluded_all.extend(excluded)
+
+    # 非出演と確定したURLを記録（次回以降の再検証を省略）
+    if excluded_all:
+        today = date.today().isoformat()
+        for u in excluded_all:
+            checked[u] = today
+    save_checked_urls(checked)
+
+    new_events.sort(key=lambda e: e["url"])
+    print(f"[DEBUG] 最終抽出された「Falench.」出演ライブ数: {len(new_events)}"
+          f"  [合計 {time.time() - t_start:.1f}s]")
     return new_events
 
 
