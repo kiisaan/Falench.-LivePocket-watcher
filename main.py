@@ -264,6 +264,14 @@ def _from_jsonld(html):
 
 
 def _dump_debug(url, body_text, html):
+        print(f"----- [DUMP] {url} -----")
+    kw = re.compile(r'日時|日程|開場|開演|販売|受付|発売|期間|チケット|\d{1,2}[/.月]\d{1,2}')
+    shown = 0
+    for l in _clean_lines(body_text):
+        if kw.search(l) and shown < 80:
+            print(f"  | {l[:150]}")
+            shown += 1
+    print("----- [DUMP END] -----")
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         slug = re.sub(r'[^A-Za-z0-9_-]+', "_", url.rstrip("/").split("/")[-1])[:60] or "page"
@@ -471,3 +479,11 @@ if __name__ == "__main__":
         if success:
             new_urls = {e["url"] for e in new_events}
             save_notified_urls(new_urls, notified_urls)
+
+    - name: Upload debug pages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug_pages/
+          if-no-files-found: ignore
