@@ -2,7 +2,8 @@ import os
 import re
 import json
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
@@ -14,8 +15,12 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 CACHE_FILE = "notified_urls.txt"
 ORGANIZERS_FILE = "organizers.json"
-CHECKED_FILE = "checked_urls.json"  # 「Falench.非出演」と判定済みのURL（再検証の省略用）
-RECHECK_DAYS = 3                    # 非出演と判定したURLを再検証するまでの日数
+# 「Falench.非出演」と判定したイベントの終了日を記録するファイル。
+# 開催済み（終了日が過去）のイベントだけを次回以降スキップする。開催前のイベントは毎回再検証する
+# （後からFalench.の出演が追加される場合があるため）。
+CHECKED_FILE = "past_events.json"
+PAST_MARGIN_DAYS = 1                # 終了日からこの日数を過ぎたら「開催済み」とみなす
+JST = ZoneInfo("Asia/Tokyo")
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))  # 詳細ページの並列数
 DEBUG_DIR = "debug_pages"  # 抽出に失敗したページのテキスト/HTMLを保存する場所
 
@@ -457,6 +462,21 @@ def _new_context(p):
     return browser, context
 
 
+def _event_end_date(lines):
+    """日時ラベルの値から開催（最終）日を読み取る。読み取れなければ None（=毎回再検証する）"""
+    raw = _labeled_value(lines, DATE_LABELS)
+    if not raw:
+        return None
+    found = re.findall(r'(20\d{2})\s*(?:[/.\-]|年)\s*(\d{1,2})\s*(?:[/.\-]|月)\s*(\d{1,2})', raw)
+    dates = []
+    for y, m, d in found:
+        try:
+            dates.append(date(int(y), int(m), int(d)))
+        except ValueError:
+            pass
+    return max(dates) if dates else None
+
+
 def load_checked_urls():
     if os.path.exists(CHECKED_FILE):
         try:
@@ -469,28 +489,30 @@ def load_checked_urls():
     return {}
 
 
-def is_recently_checked(url, checked):
+def is_past_event(url, checked):
+    """開催済み（終了日が十分過去）の非出演イベントか"""
     d = checked.get(url)
     if not d:
         return False
     try:
-        return (date.today() - date.fromisoformat(d)).days < RECHECK_DAYS
+        end = date.fromisoformat(d)
     except Exception:
         return False
+    return end < datetime.now(JST).date() - timedelta(days=PAST_MARGIN_DAYS)
 
 
 def save_checked_urls(checked):
-    today = date.today()
+    limit = datetime.now(JST).date() - timedelta(days=365)
     pruned = {}
     for url, d in checked.items():
         try:
-            if (today - date.fromisoformat(d)).days <= 30:  # 古い記録は捨てる
+            if date.fromisoformat(d) >= limit:  # 1年以上前の記録は捨てる
                 pruned[url] = d
         except Exception:
             pass
     with open(CHECKED_FILE, "w", encoding="utf-8") as f:
         json.dump(dict(sorted(pruned.items())), f, ensure_ascii=False, indent=0)
-    print(f"[DEBUG] 非出演キャッシュに {len(pruned)} 件保存しました。")
+    print(f"[DEBUG] 非出演イベントの記録を {len(pruned)} 件保存しました。")
 
 
 def _check_urls_worker(urls):
@@ -537,9 +559,10 @@ def _check_urls_worker(urls):
                     })
                 else:
                     print(f"[EXCLUDE] Falench非出演のため除外: {url}")
-                    # ページが正常に読めた(h1がある)場合のみ「非出演」を記録する
-                    if detail_soup.find("h1"):
-                        excluded.append(url)
+                    # 開催日を読み取れた場合のみ記録する（読めなければ毎回再検証＝取りこぼし防止）
+                    end_date = _event_end_date(_clean_lines(_soup_text(detail_html)))
+                    if detail_soup.find("h1") and end_date:
+                        excluded.append((url, end_date.isoformat()))
 
             except Exception as e:
                 print(f"[WARN] 詳細検証失敗 ({url}): {e}")
@@ -589,7 +612,7 @@ def fetch_falench_events(notified_urls):
                         continue
                     if clean_url in notified_urls:
                         continue
-                    if is_recently_checked(clean_url, checked):
+                    if is_past_event(clean_url, checked):
                         skipped_checked += 1
                         continue
 
@@ -601,7 +624,7 @@ def fetch_falench_events(notified_urls):
 
     candidates = sorted(candidate_urls)
     print(f"[DEBUG] 収集された検証対象のイベント総数: {len(candidates)}"
-          f"（非出演キャッシュで省略: {skipped_checked} 件）  [{time.time() - t_start:.1f}s]")
+          f"（開催済みで省略: {skipped_checked} 件）  [{time.time() - t_start:.1f}s]")
 
     # 2. 詳細ページを並列に検証・情報抽出
     new_events = []
@@ -615,11 +638,9 @@ def fetch_falench_events(notified_urls):
                 new_events.extend(events)
                 excluded_all.extend(excluded)
 
-    # 非出演と確定したURLを記録（次回以降の再検証を省略）
-    if excluded_all:
-        today = date.today().isoformat()
-        for u in excluded_all:
-            checked[u] = today
+    # 非出演だったイベントの終了日を記録（開催済みになったものだけ次回以降スキップされる）
+    for u, end_iso in excluded_all:
+        checked[u] = end_iso
     save_checked_urls(checked)
 
     new_events.sort(key=lambda e: e["url"])
