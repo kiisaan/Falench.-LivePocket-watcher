@@ -227,7 +227,7 @@ def _fmt_iso(s):
     if not m:
         return ""
     y, mo, d, hh, mm = m.groups()
-    return f"{y}/{mo}/{d}" + (f" {hh}:{mm}" if hh else "")
+    return f"{y}/{mo}/{d}" + (f" {hh}:{mm}" if hh and (hh, mm) != ("00", "00") else "")
 
 
 def _from_jsonld(html):
@@ -264,14 +264,23 @@ def _from_jsonld(html):
 
 
 def _dump_debug(url, body_text, html):
-    # Actionsのログに日時・販売関連の行を出力
+    lines = _clean_lines(body_text)
+    html = html or ""
     print(f"----- [DUMP] {url} -----")
-    kw = re.compile(r'日時|日程|開場|開演|販売|受付|発売|期間|チケット|\d{1,2}[/.月]\d{1,2}')
+    print(f"  body行数={len(lines)} / html長={len(html)} / iframe数={html.count('<iframe')}")
+    for l in lines[:150]:
+        print(f"  | {l[:120]}")
+
+    soup = BeautifulSoup(html, "html.parser")
+    for fr in soup.find_all("iframe")[:5]:
+        print(f"  [iframe] {str(fr.get('src', ''))[:150]}")
+
     shown = 0
-    for l in _clean_lines(body_text):
-        if kw.search(l) and shown < 80:
-            print(f"  | {l[:150]}")
-            shown += 1
+    for m in re.finditer(r'.{0,60}(?:販売|受付期間|sale_start|sales_start|ticket).{0,100}', html, re.IGNORECASE):
+        if shown >= 15:
+            break
+        print(f"  [html] {m.group(0).replace(chr(10), ' ')[:180]}")
+        shown += 1
     print("----- [DUMP END] -----")
 
     try:
@@ -280,8 +289,7 @@ def _dump_debug(url, body_text, html):
         with open(os.path.join(DEBUG_DIR, f"{slug}.txt"), "w", encoding="utf-8") as f:
             f.write(body_text or "")
         with open(os.path.join(DEBUG_DIR, f"{slug}.html"), "w", encoding="utf-8") as f:
-            f.write(html or "")
-        print(f"[DEBUG] 抽出失敗ページを {DEBUG_DIR}/{slug}.txt|.html に保存しました。")
+            f.write(html)
     except Exception as e:
         print(f"[WARN] デバッグ保存失敗: {e}")
 
