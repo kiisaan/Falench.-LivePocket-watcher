@@ -482,10 +482,3 @@ if __name__ == "__main__":
             new_urls = {e["url"] for e in new_events}
             save_notified_urls(new_urls, notified_urls)
 
-    - name: Upload debug pages
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-pages
-          path: debug_pages/
-          if-no-files-found: ignore
