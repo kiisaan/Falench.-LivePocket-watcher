@@ -1,12 +1,14 @@
 import os
 import re
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 CACHE_FILE = "notified_urls.txt"
 ORGANIZERS_FILE = "organizers.json"
@@ -512,45 +514,103 @@ def fetch_falench_events(notified_urls):
     return new_events
 
 
+LINE_TEXT_LIMIT = 4500     # LINEのテキスト上限は5000文字。余裕を持たせる
+DISCORD_TEXT_LIMIT = 1900  # Discordのcontent上限は2000文字。余裕を持たせる
+
+
+def build_message_chunks(events, limit):
+    """イベント単位で区切りながら、文字数上限に収まるようメッセージを分割する"""
+    header = "🎉 【Falench.】出演のチケット・ライブ情報が見つかりました！\n\n"
+    blocks = [
+        f"📌 {e['title']}\n"
+        f"📅 日程: {e['date']}\n"
+        f"🎟 販売期間: {e['sales_period']}\n"
+        f"🔗 {e['url']}"
+        for e in events
+    ]
+
+    chunks = []
+    current = header
+    for block in blocks:
+        candidate = current + block + "\n\n"
+        if len(candidate) > limit and current.strip() and current != header:
+            chunks.append(current.strip())
+            current = block + "\n\n"
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
 def send_line_notification(events):
     if not events:
         print("[INFO] 送信する新着イベントがありません。")
         return False
 
-    message_text = "🎉 【Falench.】出演のチケット・ライブ情報が見つかりました！\n\n"
-    for event in events:
-        message_text += (
-            f"📌 {event['title']}\n"
-            f"📅 日程: {event['date']}\n"
-            f"🎟 販売期間: {event['sales_period']}\n"
-            f"🔗 {event['url']}\n\n"
-        )
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("[INFO] LINEの認証情報が未設定のため、LINE通知をスキップします。")
+        return False
 
     endpoint = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
-    payload = {
-        "to": LINE_USER_ID,
-        "messages": [
-            {
-                "type": "text",
-                "text": message_text.strip()
-            }
-        ]
-    }
 
-    res = requests.post(endpoint, json=payload, headers=headers, timeout=30)
-    print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
-    print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
+    all_ok = True
+    for chunk in build_message_chunks(events, LINE_TEXT_LIMIT):
+        payload = {
+            "to": LINE_USER_ID,
+            "messages": [{"type": "text", "text": chunk}]
+        }
+        res = requests.post(endpoint, json=payload, headers=headers, timeout=30)
+        print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
+        print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
+        if res.status_code != 200:
+            print(f"[ERROR] LINE送信失敗: {res.status_code}")
+            all_ok = False
 
-    if res.status_code == 200:
+    if all_ok:
         print("[SUCCESS] LINEへの通知が成功しました！")
-        return True
-    else:
-        print(f"[ERROR] LINE送信失敗: {res.status_code}")
+    return all_ok
+
+
+def send_discord_notification(events):
+    if not events:
         return False
+
+    if not DISCORD_WEBHOOK_URL:
+        print("[INFO] DISCORD_WEBHOOK_URL が未設定のため、Discord通知をスキップします。")
+        return False
+
+    all_ok = True
+    for chunk in build_message_chunks(events, DISCORD_TEXT_LIMIT):
+        payload = {
+            "content": chunk,
+            "allowed_mentions": {"parse": []},  # タイトル中の@everyone等でメンションが飛ばないようにする
+        }
+        res = None
+        for attempt in range(2):
+            res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+            if res.status_code == 429 and attempt == 0:
+                try:
+                    wait = float(res.json().get("retry_after", 1))
+                except Exception:
+                    wait = 1.0
+                print(f"[WARN] Discordのレート制限。{wait}秒待って再送します。")
+                time.sleep(min(wait, 10))
+                continue
+            break
+
+        print(f"[DEBUG] Discord APIレスポンスコード: {res.status_code}")
+        if res.status_code not in (200, 204):
+            print(f"[ERROR] Discord送信失敗: {res.status_code} {res.text[:200]}")
+            all_ok = False
+
+    if all_ok:
+        print("[SUCCESS] Discordへの通知が成功しました！")
+    return all_ok
 
 
 if __name__ == "__main__":
@@ -558,7 +618,16 @@ if __name__ == "__main__":
     new_events = fetch_falench_events(notified_urls)
 
     if new_events:
-        success = send_line_notification(new_events)
-        if success:
+        results = {
+            "LINE": send_line_notification(new_events),
+            "Discord": send_discord_notification(new_events),
+        }
+        for name, ok in results.items():
+            print(f"[RESULT] {name}: {'成功' if ok else '失敗/スキップ'}")
+
+        # どちらか一方でも届いていれば既読扱いにして、届いた側への重複通知を防ぐ
+        if any(results.values()):
             new_urls = {e["url"] for e in new_events}
             save_notified_urls(new_urls, notified_urls)
+        else:
+            print("[ERROR] どの通知先にも送信できなかったため、キャッシュは更新しません。")
