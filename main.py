@@ -103,10 +103,11 @@ RANGE_ANY = re.compile(rf'{DT_STRICT}\s*{RANGE_SEP}\s*(?:{DT_LOOSE}|{TIME})?')
 RANGE_FULL = re.compile(rf'{DT_STRICT}\s*{RANGE_SEP}\s*{DT_LOOSE}')
 
 # ラベル候補
-DATE_LABELS = ["開催日時", "公演日時", "開催日", "公演日", "日時", "日程", "開催期間"]
+DATE_LABELS = ["開催日時", "公演日時", "開催日", "公演日", "日時", "日程", "開催期間", "date"]
 SALES_LABELS = [
     "チケット販売期間", "販売期間", "受付期間", "申込期間", "申し込み期間",
     "発売期間", "販売日程", "受付日程", "一般発売", "販売開始", "発売日",
+    "sales period", "reception period", "application period",
 ]
 SALES_KW = re.compile(r'販売|発売|受付|申込|申し込み|締切|締め切り|まで|から')
 NOT_EVENT_DATE_KW = re.compile(r'販売|発売|受付|申込|申し込み|締切|締め切り|期限|更新|投稿|公開|まで|から|入金|支払')
@@ -117,12 +118,37 @@ CONT_RE = re.compile(
 )
 
 
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_WD = {"mon": "月", "tue": "火", "wed": "水", "thu": "木", "fri": "金", "sat": "土", "sun": "日"}
+
+
+def _normalize_en(line):
+    """
+    WOVN等で英語化された表記を日本語ページ相当に直す。
+      "2026 year Oct. 18 day (Sun)" -> "2026/10/18(日)"
+      "2026 Oct. 13 (Tue)"          -> "2026/10/13(火)"
+    """
+    def repl(m):
+        mon = _MONTHS.get(m.group(2)[:3].lower())
+        if not mon:
+            return m.group(0)
+        return f"{m.group(1)}/{mon:02d}/{int(m.group(3)):02d}"
+
+    line = re.sub(
+        r'(20\d{2})\s*(?:year(?:\(s\)|s)?)?\s*([A-Za-z]{3,9})\.?\s*(\d{1,2})\s*(?:day(?:\(s\)|s)?)?',
+        repl, line)
+    line = re.sub(r'\((Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\)',
+                  lambda m: f"({_WD[m.group(1).lower()]})", line)
+    return line
+
+
 def _clean_lines(text):
     lines = []
     for raw in (text or "").splitlines():
         line = re.sub(r'[ \t\u3000\xa0]+', ' ', raw).strip()
         if line:
-            lines.append(line)
+            lines.append(_normalize_en(line))
     return lines
 
 
@@ -144,7 +170,7 @@ def _labeled_value(lines, labels, strict=False):
     date_pat = DT_STRICT if strict else DT_LOOSE
     for i, line in enumerate(lines):
         for label in labels:
-            if not line.startswith(label):
+            if not line.lower().startswith(label.lower()):
                 continue
             rest = line[len(label):].lstrip(" :：")
             cands = [(rest, i)] if rest else []
@@ -192,7 +218,7 @@ def _extract_sales(lines, event_date=""):
 
     # 2) 1行内に「日時 ～ 日時」がある行（チケット種別ごとの販売期間）
     for line in lines:
-        if any(line.startswith(l) for l in DATE_LABELS):
+        if any(line.lower().startswith(l.lower()) for l in DATE_LABELS):
             continue
         if len(line) < 150 and RANGE_ANY.search(line):
             add(line)
@@ -204,12 +230,35 @@ def _extract_sales(lines, event_date=""):
 
     # 4) 「2026/10/01 12:00 販売開始」「10/14 23:59まで」等
     for line in lines:
-        if any(line.startswith(l) for l in DATE_LABELS):
+        if any(line.lower().startswith(l.lower()) for l in DATE_LABELS):
             continue
         if len(line) < 100 and SALES_KW.search(line) and re.search(DT_LOOSE, line):
             add(line)
 
     return " / ".join(found[:4])
+
+
+def _collapse_same_day(s):
+    """「10/18(日) ～ 10/18(日)」のような同日範囲を1日にまとめる"""
+    parts = re.split(r'\s*[～〜~–—]\s*', s)
+    if len(parts) == 2:
+        d1, d2 = re.search(DATE_STRICT, parts[0]), re.search(DATE_STRICT, parts[1])
+        if d1 and d2 and re.sub(r'\s+', '', d1.group(0)) == re.sub(r'\s+', '', d2.group(0)):
+            return parts[0].strip()
+    return s
+
+
+def _find_open_start(lines):
+    """OPEN19:25/START19:40 形式の開場・開演時刻を探す"""
+    pat = re.compile(
+        r'(?:OPEN|開場)\s*\d{1,2}[:：]\d{2}(?:\s*[/／]\s*(?:START|開演)\s*\d{1,2}[:：]\d{2})?',
+        re.IGNORECASE)
+    for line in lines:
+        if len(line) < 80:
+            m = pat.search(line)
+            if m:
+                return m.group(0)
+    return ""
 
 
 def _iter_dicts(obj):
@@ -270,17 +319,6 @@ def _dump_debug(url, body_text, html):
     print(f"  body行数={len(lines)} / html長={len(html)} / iframe数={html.count('<iframe')}")
     for l in lines[:150]:
         print(f"  | {l[:120]}")
-
-    soup = BeautifulSoup(html, "html.parser")
-    for fr in soup.find_all("iframe")[:5]:
-        print(f"  [iframe] {str(fr.get('src', ''))[:150]}")
-
-    shown = 0
-    for m in re.finditer(r'.{0,60}(?:販売|受付期間|sale_start|sales_start|ticket).{0,100}', html, re.IGNORECASE):
-        if shown >= 15:
-            break
-        print(f"  [html] {m.group(0).replace(chr(10), ' ')[:180]}")
-        shown += 1
     print("----- [DUMP END] -----")
 
     try:
@@ -318,9 +356,11 @@ def extract_event_details_from_page(page, url=""):
 
     # --- 開催日時 ---
     event_date = ""
+    event_lines = texts[0]
     for lines in texts:
         event_date = _labeled_value(lines, DATE_LABELS)
         if event_date:
+            event_lines = lines
             break
     if not event_date:
         event_date = ld["date"]
@@ -328,12 +368,21 @@ def extract_event_details_from_page(page, url=""):
         for lines in texts:
             event_date = _guess_event_date(lines)
             if event_date:
+                event_lines = lines
                 break
+
+    event_date_raw = event_date  # 販売期間の誤検出除外用に、整形前の値を保持
+    if event_date:
+        event_date = _collapse_same_day(event_date)
+        if not re.search(TIME, event_date):
+            open_start = _find_open_start(event_lines) or _find_open_start(texts[1])
+            if open_start:
+                event_date = f"{event_date} {open_start}"
 
     # --- 販売期間 ---
     sales_period = ""
     for lines in texts:
-        sales_period = _extract_sales(lines, event_date)
+        sales_period = _extract_sales(lines, event_date_raw)
         if sales_period:
             break
     if not sales_period:
@@ -360,7 +409,10 @@ def fetch_falench_events(notified_urls):
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={'width': 1280, 'height': 800}
+            viewport={'width': 1280, 'height': 800},
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            extra_http_headers={"Accept-Language": "ja-JP,ja;q=0.9"},
         )
         page = context.new_page()
 
@@ -489,4 +541,3 @@ if __name__ == "__main__":
         if success:
             new_urls = {e["url"] for e in new_events}
             save_notified_urls(new_urls, notified_urls)
-
