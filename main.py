@@ -10,6 +10,9 @@ LINE_USER_ID = os.environ.get("LINE_USER_ID")
 
 CACHE_FILE = "notified_urls.txt"
 ORGANIZERS_FILE = "organizers.json"
+DEBUG_DIR = "debug_pages"  # 抽出に失敗したページのテキスト/HTMLを保存する場所
+
+UNKNOWN = "要確認（詳細ページ参照）"
 
 
 def load_organizers():
@@ -77,111 +80,252 @@ def is_falench_performing(soup):
     return False
 
 
-def extract_event_details_from_page(page):
+# =====================================================================
+# 開催日時・販売期間の抽出
+#
+# 方針: DOM構造（dt/ddの隣接関係など）に依存せず、ページ全体を「行テキスト」に
+#       変換してから、ラベル行 + 日付パターンで取り出す。
+#   1) page.inner_text("body")        … 画面に見えているテキスト
+#   2) BeautifulSoup.get_text("\n")   … 非表示(折りたたみ等)の要素も含むテキスト
+#   3) JSON-LD (schema.org/Event)     … 埋め込まれていれば最も正確
+# の順に試し、どれも失敗した場合は debug_pages/ にダンプを保存する。
+# =====================================================================
+
+# 日付・時刻パターン
+DATE_STRICT = r'20\d{2}\s*(?:[/.\-]|年)\s*\d{1,2}\s*(?:[/.\-]|月)\s*\d{1,2}\s*日?'
+DATE_LOOSE = r'(?:20\d{2}\s*(?:[/.\-]|年)\s*)?\d{1,2}\s*(?:[/.\-]|月)\s*\d{1,2}\s*日?'
+WEEKDAY = r'(?:\s*[\(（][^\)）]{1,4}[\)）])?'
+TIME = r'\d{1,2}\s*[:：]\s*\d{2}'
+DT_STRICT = rf'{DATE_STRICT}{WEEKDAY}(?:\s*{TIME})?'
+DT_LOOSE = rf'{DATE_LOOSE}{WEEKDAY}(?:\s*{TIME})?'
+RANGE_SEP = r'(?:[～〜~–—]|\s-\s)'
+RANGE_ANY = re.compile(rf'{DT_STRICT}\s*{RANGE_SEP}\s*(?:{DT_LOOSE}|{TIME})?')
+RANGE_FULL = re.compile(rf'{DT_STRICT}\s*{RANGE_SEP}\s*{DT_LOOSE}')
+
+# ラベル候補
+DATE_LABELS = ["開催日時", "公演日時", "開催日", "公演日", "日時", "日程", "開催期間"]
+SALES_LABELS = [
+    "チケット販売期間", "販売期間", "受付期間", "申込期間", "申し込み期間",
+    "発売期間", "販売日程", "受付日程", "一般発売", "販売開始", "発売日",
+]
+SALES_KW = re.compile(r'販売|発売|受付|申込|申し込み|締切|締め切り|まで|から')
+NOT_EVENT_DATE_KW = re.compile(r'販売|発売|受付|申込|申し込み|締切|締め切り|期限|更新|投稿|公開|まで|から|入金|支払')
+
+# ラベルの次行以降に続く「値の続き」とみなす行
+CONT_RE = re.compile(
+    r'^(?:[\(（]|\d{1,2}\s*[:：]\s*\d{2}|20\d{2}\s*[/.\-年]|開場|開演|OPEN|START|Open|Start|open|start|[～〜~–—])'
+)
+
+
+def _clean_lines(text):
+    lines = []
+    for raw in (text or "").splitlines():
+        line = re.sub(r'[ \t\u3000\xa0]+', ' ', raw).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _soup_text(html):
+    """非表示要素も含めたテキスト（不要領域は除去）"""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript", "header", "footer"]):
+        t.decompose()
+    for t in soup.select(".recommend, .other-events, .related-events, .recommend-event, .other-event-list"):
+        t.decompose()
+    return soup.get_text("\n", strip=True)
+
+
+def _labeled_value(lines, labels, strict=False):
     """
-    LivePocketの動的DOMおよびテキスト構造から【開催日時】と【販売期間】を確実に抽出する強力ロジック
+    「ラベル 値」または「ラベル\\n値」形式から、日付を含む値を取り出す。
+    値が複数行に分かれている場合（日付 / (木) / 18:00 など）は連結する。
     """
-    # ページ内要素の読み込み完了とスクロール発火
+    date_pat = DT_STRICT if strict else DT_LOOSE
+    for i, line in enumerate(lines):
+        for label in labels:
+            if not line.startswith(label):
+                continue
+            rest = line[len(label):].lstrip(" :：")
+            cands = [(rest, i)] if rest else []
+            cands += [(lines[j], j) for j in range(i + 1, min(i + 4, len(lines)))]
+            for text, j in cands:
+                if len(text) < 150 and re.search(date_pat, text):
+                    parts = [text]
+                    for k in range(j + 1, min(j + 4, len(lines))):
+                        if len(lines[k]) < 40 and CONT_RE.match(lines[k]):
+                            parts.append(lines[k])
+                        else:
+                            break
+                    return re.sub(r'\s+', ' ', " ".join(parts)).strip()
+    return ""
+
+
+def _guess_event_date(lines):
+    """ラベルが見つからない場合のヒューリスティック"""
+    for line in lines:
+        if (len(line) < 150 and re.search(DT_STRICT, line)
+                and re.search(r'開場|開演|OPEN|START', line, re.IGNORECASE)
+                and not NOT_EVENT_DATE_KW.search(line)):
+            return re.sub(r'\s+', ' ', line).strip()
+    for line in lines:
+        if len(line) < 80 and re.search(DT_STRICT, line) and not NOT_EVENT_DATE_KW.search(line):
+            return re.sub(r'\s+', ' ', line).strip()
+    return ""
+
+
+def _extract_sales(lines, event_date=""):
+    found = []
+
+    def add(s):
+        s = re.sub(r'\s+', ' ', s).strip()
+        if not s or len(s) >= 150:
+            return
+        if event_date and len(event_date) > 8 and event_date in s:
+            return
+        if any(s in f or f in s for f in found):
+            return
+        found.append(s)
+
+    # 1) ラベル付き（販売期間: ... など）
+    add(_labeled_value(lines, SALES_LABELS))
+
+    # 2) 1行内に「日時 ～ 日時」がある行（チケット種別ごとの販売期間）
+    for line in lines:
+        if any(line.startswith(l) for l in DATE_LABELS):
+            continue
+        if len(line) < 150 and RANGE_ANY.search(line):
+            add(line)
+
+    # 3) 「日時 / ～ / 日時」のように行が分割されている場合に備え、全体を連結して探索
+    flat = " ".join(lines)
+    for m in RANGE_FULL.finditer(flat):
+        add(m.group(0))
+
+    # 4) 「2026/10/01 12:00 販売開始」「10/14 23:59まで」等
+    for line in lines:
+        if any(line.startswith(l) for l in DATE_LABELS):
+            continue
+        if len(line) < 100 and SALES_KW.search(line) and re.search(DT_LOOSE, line):
+            add(line)
+
+    return " / ".join(found[:4])
+
+
+def _iter_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_dicts(v)
+
+
+def _fmt_iso(s):
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?', str(s or ""))
+    if not m:
+        return ""
+    y, mo, d, hh, mm = m.groups()
+    return f"{y}/{mo}/{d}" + (f" {hh}:{mm}" if hh else "")
+
+
+def _from_jsonld(html):
+    result = {"date": "", "sales": ""}
+    soup = BeautifulSoup(html, "html.parser")
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(s.string or s.get_text())
+        except Exception:
+            continue
+        for node in _iter_dicts(data):
+            t = node.get("@type")
+            types = t if isinstance(t, list) else [t]
+            if not any(isinstance(x, str) and x.endswith("Event") for x in types):
+                continue
+            start = _fmt_iso(node.get("startDate"))
+            end = _fmt_iso(node.get("endDate"))
+            if start and not result["date"]:
+                result["date"] = start if (not end or end == start) else f"{start} ～ {end}"
+            offers = node.get("offers")
+            offers = offers if isinstance(offers, list) else ([offers] if offers else [])
+            periods = []
+            for o in offers:
+                if not isinstance(o, dict):
+                    continue
+                vf, vt = _fmt_iso(o.get("validFrom")), _fmt_iso(o.get("validThrough"))
+                if vf or vt:
+                    p = f"{vf} ～ {vt}".strip()
+                    if p not in periods:
+                        periods.append(p)
+            if periods and not result["sales"]:
+                result["sales"] = " / ".join(periods[:4])
+    return result
+
+
+def _dump_debug(url, body_text, html):
     try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3);")
-        page.wait_for_timeout(500)
-        page.evaluate("window.scrollTo(0, (document.body.scrollHeight / 3) * 2);")
-        page.wait_for_timeout(500)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        page.wait_for_timeout(1000)
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        slug = re.sub(r'[^A-Za-z0-9_-]+', "_", url.rstrip("/").split("/")[-1])[:60] or "page"
+        with open(os.path.join(DEBUG_DIR, f"{slug}.txt"), "w", encoding="utf-8") as f:
+            f.write(body_text or "")
+        with open(os.path.join(DEBUG_DIR, f"{slug}.html"), "w", encoding="utf-8") as f:
+            f.write(html or "")
+        print(f"[DEBUG] 抽出失敗ページを {DEBUG_DIR}/{slug}.txt|.html に保存しました。")
+    except Exception as e:
+        print(f"[WARN] デバッグ保存失敗: {e}")
+
+
+def extract_event_details_from_page(page, url=""):
+    """
+    LivePocketのイベント詳細ページから【開催日時】と【販売期間】を抽出する。
+    """
+    # 遅延描画される要素を読み込ませる
+    try:
+        for ratio in (1 / 3, 2 / 3, 1):
+            page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {ratio});")
+            page.wait_for_timeout(600)
+        page.wait_for_timeout(800)
     except Exception:
         pass
 
-    # チケットエリアまたは詳細エリアの存在を待機（存在しなくてもエラー回避）
     try:
-        page.wait_for_selector('.ticket-item, .ticket_item, dt, #event-detail', timeout=3000)
+        body_text = page.inner_text("body")
     except Exception:
-        pass
+        body_text = ""
+    html = page.content()
 
-    details = page.evaluate("""() => {
-        let dateStr = "";
-        let salesList = [];
+    texts = [_clean_lines(body_text), _clean_lines(_soup_text(html))]
+    ld = _from_jsonld(html)
 
-        // ------------------------------------------
-        // 1. 開催日時の抽出
-        // ------------------------------------------
-        // パターンA: dt/dd, th/td, またはクラス名からの検索
-        const labelNodes = document.querySelectorAll('dt, th, span, div, p, td, strong');
-        for (let labelNode of labelNodes) {
-            const txt = (labelNode.innerText || "").trim();
-            if (txt === "日時" || txt === "日程" || txt === "開催日時" || txt === "開催日" || txt.includes("公演日時")) {
-                let valNode = labelNode.nextElementSibling;
-                if (!valNode && labelNode.parentElement) {
-                    valNode = labelNode.parentElement.querySelector('dd, td, div, span');
-                }
-                if (valNode) {
-                    const valText = (valNode.innerText || "").trim();
-                    if (valText && valText.length < 200) {
-                        dateStr = valText;
-                        break;
-                    }
-                }
-            }
-        }
+    # --- 開催日時 ---
+    event_date = ""
+    for lines in texts:
+        event_date = _labeled_value(lines, DATE_LABELS)
+        if event_date:
+            break
+    if not event_date:
+        event_date = ld["date"]
+    if not event_date:
+        for lines in texts:
+            event_date = _guess_event_date(lines)
+            if event_date:
+                break
 
-        // パターンB: 全体テキストから「開場」「開演」または「202x/xx/xx」等の日時表記を抽出
-        if (!dateStr) {
-            const bodyText = document.body.innerText;
-            // 例: 2026年10月15日(木) 18:00〜 / 2026/10/15(木) 開場 17:30
-            const dateRegex = /(?:20\\d{2}[\\/\\.-]\\d{1,2}[\\/\\.-]\\d{1,2}|20\\d{2}年\\d{1,2}月\\d{1,2}日)\\s*(?:\\([^\\)]+\\))?\\s*(?:開場|開演)?\\s*(?:[0-2]?\\d:[0-5]\\d)?/g;
-            const matches = bodyText.match(dateRegex);
-            if (matches && matches.length > 0) {
-                dateStr = matches[0];
-            }
-        }
+    # --- 販売期間 ---
+    sales_period = ""
+    for lines in texts:
+        sales_period = _extract_sales(lines, event_date)
+        if sales_period:
+            break
+    if not sales_period:
+        sales_period = ld["sales"]
 
-        // ------------------------------------------
-        // 2. チケット販売期間の抽出
-        // ------------------------------------------
-        // パターンA: チケットブロック要素からの抽出
-        const ticketNodes = document.querySelectorAll('[class*="ticket"], [class*="period"], [class*="sale"]');
-        ticketNodes.forEach(node => {
-            const text = (node.innerText || "").trim();
-            // 販売期間特有の「～」や「販売」を含み、かつ日付形式を含む行を判定
-            if (text && (text.includes("～") || text.includes("~") || text.includes("受付") || text.includes("販売")) && text.match(/\\d{1,2}[\\/\\.-]\\d{1,2}|\\d{1,2}月\\d{1,2}日/)) {
-                // 長すぎる親要素のテキスト塊を除外するため適度な長さに絞る
-                const lines = text.split('\\n').map(l => l.trim());
-                for (let line of lines) {
-                    if ((line.includes("～") || line.includes("~") || line.includes("販売") || line.includes("受付")) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}|\\d{1,2}月\\d{1,2}日/)) {
-                        if (!salesList.includes(line) && line.length < 120) {
-                            salesList.push(line);
-                        }
-                    }
-                }
-            }
-        });
+    if not event_date or not sales_period:
+        print(f"[DEBUG] 抽出不足 date={bool(event_date)} sales={bool(sales_period)} → ダンプ保存")
+        _dump_debug(url, body_text, html)
 
-        // パターンB: ページ全テキストから「販売期間」「受付期間」の行をフォールバック抽出
-        if (salesList.length === 0) {
-            const bodyLines = document.body.innerText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-            for (let line of bodyLines) {
-                if ((line.includes("販売期間") || line.includes("受付期間") || line.includes("申込期間") || (line.includes("販売") && line.includes("～"))) && line.match(/\\d{1,2}[\\/\\.-]\\d{1,2}|\\d{1,2}月\\d{1,2}日/)) {
-                    if (!salesList.includes(line) && line.length < 120) {
-                        salesList.push(line);
-                    }
-                }
-            }
-        }
-
-        return {
-            event_date: dateStr.trim(),
-            sales_period: salesList.length > 0 ? salesList.join(" / ") : ""
-        };
-    }""")
-
-    event_date = details.get("event_date") or "要確認（詳細ページ参照）"
-    sales_period = details.get("sales_period") or "要確認（詳細ページ参照）"
-
-    # 整形
-    event_date = re.sub(r'\s+', ' ', event_date)
-    sales_period = re.sub(r'\s+', ' ', sales_period)
-
-    return event_date, sales_period
+    return (event_date or UNKNOWN), (sales_period or UNKNOWN)
 
 
 def fetch_falench_events(notified_urls):
@@ -252,8 +396,8 @@ def fetch_falench_events(notified_urls):
                     if len(clean_title) > 70:
                         clean_title = clean_title[:70] + "..."
 
-                    # イベント詳細（開催日時・販売期間）を精密抽出
-                    event_date, sales_period = extract_event_details_from_page(page)
+                    # イベント詳細（開催日時・販売期間）を抽出
+                    event_date, sales_period = extract_event_details_from_page(page, url)
 
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
                     print(f"       📅 日程: {event_date}")
@@ -306,7 +450,7 @@ def send_line_notification(events):
         ]
     }
 
-    res = requests.post(endpoint, json=payload, headers=headers)
+    res = requests.post(endpoint, json=payload, headers=headers, timeout=30)
     print(f"[DEBUG] LINE APIレスポンスコード: {res.status_code}")
     print(f"[DEBUG] LINE APIレスポンス詳細: {res.text}")
 
