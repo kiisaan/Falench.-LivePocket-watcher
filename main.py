@@ -162,9 +162,9 @@ def _soup_text(html):
     return soup.get_text("\n", strip=True)
 
 
-def _labeled_value(lines, labels, strict=False):
+def _labeled_values(lines, labels, strict=False):
     """
-    「ラベル 値」または「ラベル\\n値」形式から、日付を含む値を取り出す。
+    「ラベル 値」または「ラベル\\n値」形式から、日付を含む値をすべて取り出す（ジェネレータ）。
     値が複数行に分かれている場合（日付 / (木) / 18:00 など）は連結する。
     """
     date_pat = DT_STRICT if strict else DT_LOOSE
@@ -175,6 +175,7 @@ def _labeled_value(lines, labels, strict=False):
             rest = line[len(label):].lstrip(" :：")
             cands = [(rest, i)] if rest else []
             cands += [(lines[j], j) for j in range(i + 1, min(i + 4, len(lines)))]
+            matched = False
             for text, j in cands:
                 if len(text) < 150 and re.search(date_pat, text):
                     parts = [text]
@@ -183,8 +184,15 @@ def _labeled_value(lines, labels, strict=False):
                             parts.append(lines[k])
                         else:
                             break
-                    return re.sub(r'\s+', ' ', " ".join(parts)).strip()
-    return ""
+                    yield re.sub(r'\s+', ' ', " ".join(parts)).strip()
+                    matched = True
+                    break
+            if matched:
+                break
+
+
+def _labeled_value(lines, labels, strict=False):
+    return next(_labeled_values(lines, labels, strict), "")
 
 
 def _guess_event_date(lines):
@@ -200,6 +208,9 @@ def _guess_event_date(lines):
     return ""
 
 
+SECTION_CUT_RE = re.compile(r'同じ(?:主催|販売元)|販売元の他|主催者の他|Events from the same', re.IGNORECASE)
+
+
 def _extract_sales(lines, event_date=""):
     found = []
 
@@ -207,33 +218,43 @@ def _extract_sales(lines, event_date=""):
         s = re.sub(r'\s+', ' ', s).strip()
         if not s or len(s) >= 150:
             return
-        if event_date and len(event_date) > 8 and event_date in s:
+        if event_date and s == re.sub(r'\s+', ' ', event_date).strip():
             return
         if any(s in f or f in s for f in found):
             return
         found.append(s)
 
-    # 1) ラベル付き（販売期間: ... など）
-    add(_labeled_value(lines, SALES_LABELS))
+    # 1) ラベル付き（販売期間: ... など）を最優先。チケット種別ごとに複数あれば全部拾う
+    for v in _labeled_values(lines, SALES_LABELS):
+        add(v)
+    if found:
+        return " / ".join(found[:4])
 
-    # 2) 1行内に「日時 ～ 日時」がある行（チケット種別ごとの販売期間）
+    # 2) ラベルが無い場合のみのフォールバック。
+    #    「同じ主催者のイベント」以降は他イベントなので対象外にする
+    for idx, line in enumerate(lines):
+        if SECTION_CUT_RE.search(line):
+            lines = lines[:idx]
+            break
+
     for line in lines:
         if any(line.lower().startswith(l.lower()) for l in DATE_LABELS):
             continue
-        if len(line) < 150 and RANGE_ANY.search(line):
+        # 同日の範囲（10/13 ～ 10/13）は開催日程であって販売期間ではない
+        if len(line) < 150 and RANGE_ANY.search(line) and _collapse_same_day(line) == line:
             add(line)
 
-    # 3) 「日時 / ～ / 日時」のように行が分割されている場合に備え、全体を連結して探索
     flat = " ".join(lines)
     for m in RANGE_FULL.finditer(flat):
-        add(m.group(0))
+        if _collapse_same_day(m.group(0)) == m.group(0):
+            add(m.group(0))
 
-    # 4) 「2026/10/01 12:00 販売開始」「10/14 23:59まで」等
-    for line in lines:
-        if any(line.lower().startswith(l.lower()) for l in DATE_LABELS):
-            continue
-        if len(line) < 100 and SALES_KW.search(line) and re.search(DT_LOOSE, line):
-            add(line)
+    if not found:
+        for line in lines:
+            if any(line.lower().startswith(l.lower()) for l in DATE_LABELS):
+                continue
+            if len(line) < 100 and SALES_KW.search(line) and re.search(DT_LOOSE, line):
+                add(line)
 
     return " / ".join(found[:4])
 
