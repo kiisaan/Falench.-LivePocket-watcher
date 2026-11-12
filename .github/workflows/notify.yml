@@ -2,13 +2,18 @@ name: LivePocket Falench. Notifier
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '17 * * * *'  # 保険（0分は混むので避ける）。本命は cron-job.org からの起動
   workflow_dispatch:
     inputs:
       clear_cache:
         description: 'キャッシュをクリアして再取得しますか？'
         type: boolean
         default: false
+
+# 同時に動かさない（通知済みキャッシュを2つが同時に読んで二重通知になるのを防ぐ）
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   run-bot:
