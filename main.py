@@ -9,6 +9,8 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+import sheet_sync
+
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.environ.get("LINE_USER_ID")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -547,15 +549,33 @@ def _check_urls_worker(urls):
 
                     event_date, sales_period = extract_event_details_from_page(page, url)
 
+                    # スプシ反映用：会場・公演日（date型）・販売開始日時
+                    html_now = page.content()
+                    try:
+                        body_now = page.inner_text("body")
+                    except Exception:
+                        body_now = ""
+                    lines_all = sheet_sync.clean_lines(body_now) + sheet_sync.clean_lines(_soup_text(html_now))
+                    venue = (sheet_sync.venue_from_lines(lines_all)
+                             or sheet_sync.venue_from_html(html_now))
+                    event_day = (sheet_sync.parse_event_date(event_date) if event_date != UNKNOWN else None) \
+                        or sheet_sync.event_date_from_html(html_now)
+                    release_at = sheet_sync.parse_release_at(sales_period, event_day) \
+                        if sales_period != UNKNOWN else None
+
                     print(f"[MATCH] ★Falench.の出演を確認！: {clean_title} ({url})")
                     print(f"       📅 日程: {event_date}")
                     print(f"       🎟 販売期間: {sales_period}")
+                    print(f"       📍 会場: {venue or '（取得できず）'} / 公演日: {event_day} / チケ発: {release_at}")
 
                     events.append({
                         "title": clean_title,
                         "url": url,
                         "date": event_date,
                         "sales_period": sales_period,
+                        "venue": venue,
+                        "event_date": event_day,
+                        "release_at": release_at,
                     })
                 else:
                     print(f"[EXCLUDE] Falench非出演のため除外: {url}")
@@ -660,7 +680,9 @@ def build_message_chunks(events, limit):
         f"📌 {e['title']}\n"
         f"📅 日程: {e['date']}\n"
         f"🎟 販売期間: {e['sales_period']}\n"
-        f"🔗 {e['url']}"
+        + (f"📍 会場: {e['venue']}\n" if e.get("venue") else "")
+        + f"🔗 {e['url']}"
+        + (f"\n{e['sheet_status']}" if e.get("sheet_status") else "")
         for e in events
     ]
 
@@ -753,6 +775,9 @@ if __name__ == "__main__":
     new_events = fetch_falench_events(notified_urls)
 
     if new_events:
+        # 先にスプシへ反映し、その結果（何行目を更新したか等）を通知に載せる
+        sheet_sync.sync_events_to_sheet(new_events, source="LivePocket")
+
         results = {
             "LINE": send_line_notification(new_events),
             "Discord": send_discord_notification(new_events),
