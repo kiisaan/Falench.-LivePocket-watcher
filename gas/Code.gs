@@ -19,6 +19,7 @@
 
 const CONFIG = {
   TEMPLATE_SHEET: '202x/x月',     // 月タブが無いときにコピーする雛形
+  RELEASED_TEXT: 'チケ発済み',
   TZ: 'Asia/Tokyo',
   // 同じ日付の「仮の行」とみなすイベント名（チケページが空のときだけ上書きする）
   PLACEHOLDER_RE: /^(?:|事務所?主催|対バン|未定|tba|tbd|[?？]+|-+|ー+)$/i,
@@ -252,11 +253,54 @@ function writeDate_(sheet, layout, rows, rowNo, year, month, day, label) {
 // ---------------------------------------------------------------------------
 // チケ発時刻
 // ---------------------------------------------------------------------------
-/** "2026-11-13T21:00" → "11/13 21:00"（販売開始日時だけを書く） */
+function nowKey_() {
+  return Utilities.formatDate(new Date(), CONFIG.TZ, "yyyy-MM-dd'T'HH:mm");
+}
+
+/** "2026-11-13T21:00" → "11/13 21:00"（販売開始日時だけ。既に過ぎていれば「チケ発済み」） */
 function releaseText_(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso);
   if (!m) return iso;
+  if (iso.slice(0, 16) <= nowKey_()) return CONFIG.RELEASED_TEXT;
   return (+m[2]) + '/' + (+m[3]) + ' ' + m[4] + ':' + m[5];
+}
+
+/**
+ * 時間主導トリガー用：チケ発時刻（「11/13 21:00」など）を過ぎたセルを「チケ発済み」に書き換える。
+ * setup() を実行すると15分おきに動くようになる。
+ * 手入力で日時として保存されたセル（2026/11/13 21:00:00 と表示されるもの）も対象にする。
+ */
+function markReleased() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const now = nowKey_();
+  ss.getSheets().forEach(function (sheet) {
+    const sm = /^\s*(\d{4})\s*\/\s*0?(\d{1,2})\s*月\s*$/.exec(sheet.getName());
+    if (!sm) return;
+    const layout = readLayout_(sheet);
+    if (!layout || !layout.release) return;
+    const first = layout.header + 1, last = sheet.getLastRow();
+    if (last < first) return;
+    const range = sheet.getRange(first, layout.release, last - first + 1, 1);
+    const vals = range.getValues();
+    const disp = range.getDisplayValues();
+    const changedRows = [];
+    vals.forEach(function (v, i) {
+      let key = null;
+      if (v[0] instanceof Date) {
+        key = Utilities.formatDate(v[0], CONFIG.TZ, "yyyy-MM-dd'T'HH:mm");
+      } else {
+        const m = /^\s*(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s*(\d{1,2}):(\d{2})(?::\d{2})?\s*[～〜~]?\s*$/.exec(clean_(disp[i][0]));
+        if (!m) return;
+        // 年が無ければ月タブの年。チケ発の月が公演月より大きければ前の年（12月発売→1月公演）
+        const y = m[1] ? +m[1] : (+m[2] > +sm[2] + 1 ? +sm[1] - 1 : +sm[1]);
+        key = y + '-' + pad_(+m[2]) + '-' + pad_(+m[3]) + 'T' + pad_(+m[4]) + ':' + m[5];
+      }
+      if (key && key <= now) changedRows.push(first + i);
+    });
+    changedRows.forEach(function (r) {
+      sheet.getRange(r, layout.release).setNumberFormat('@').setValue(CONFIG.RELEASED_TEXT);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -269,10 +313,11 @@ function setup() {
     token = Utilities.getUuid().replace(/-/g, '');
     props.setProperty('TOKEN', token);
   }
-  // 以前の版で作った「チケ発済み」書き換え用トリガーが残っていれば消す
+  // トリガーの二重登録を防ぐため、古いものを消してから作り直す
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'markReleased') ScriptApp.deleteTrigger(t);
   });
+  ScriptApp.newTrigger('markReleased').timeBased().everyMinutes(15).create();
   Logger.log('SHEET_TOKEN に登録する合言葉: ' + token);
 }
 
